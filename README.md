@@ -1,6 +1,11 @@
 # NuWa
 A Deep Learning Framework for High-Resolution Taiwan Weather Forecasting by Global Knowledge Integration and Adaptive Fine-Tuning. This work is developed as part of the National Science and Technology Council (NSTC) project, "Research on Key Technologies of Generative AI for Solving Localization Needs."
 
+<img width="2326" height="1226" alt="image" src="https://github.com/user-attachments/assets/b5343db6-835b-4bea-8c59-31b3cb09c85e" />
+
+<img width="2326" height="1226" alt="image" src="https://github.com/user-attachments/assets/21d3f968-405f-4267-9148-6682b82204e7" />
+
+
 ### Environment Setting
 
 We recommend using **Conda** to manage your environment. Follow these steps to set up the environment and resolve specific package compatibility issues.
