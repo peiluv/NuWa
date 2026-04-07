@@ -67,17 +67,17 @@ class Aurora_trainer:
     def __init__(self, args=None):
         self.args = args
         self.valid_count_per_batch = []
-        self.root_dir = self.args.root_dir
+        self.root_dir = "./"
         self.tranditional_model_leadtime = 4
-        self.test_checkpoint_path = self.args.test_checkpoint_path
+        self.checkpoint_path = self.args.checkpoint_path
 
         # Prefer checkpoint filename for inference prefix; fallback to codebook
-        if self.test_checkpoint_path:
-            ckpt_name = os.path.basename(self.test_checkpoint_path)
+        if self.checkpoint_path:
+            ckpt_name = os.path.basename(self.checkpoint_path)
             stem = ckpt_name[:-4] if ckpt_name.endswith('.pth') else os.path.splitext(ckpt_name)[0]
             self.file_prefix = f"test_{stem}"
-        elif self.args.codebook_path:
-            model_name = self.args.codebook_path.split("/")[-1][:-4]
+        elif self.args.dictionary_path:
+            model_name = self.args.dictionary_path.split("/")[-1][:-4]
             self.file_prefix = f"test_{model_name}"
         else:
             self.file_prefix = "test_default"
@@ -87,8 +87,8 @@ class Aurora_trainer:
         self.metric_dir = f"{self.root_dir}/metrics/" ### need model name or it will conflate
         self.test_on_map_dir = f"{self.root_dir}/plot/"
 
-        self.log_file_name = os.path.join(self.log_dir, f"{args.test_time}.log")
-        self.metric_file_name_rmse = os.path.join(self.metric_dir, f"{args.test_time}_RMSE.csv")
+        self.log_file_name = os.path.join(self.log_dir, f"{args.predict_time}.log")
+        self.metric_file_name_rmse = os.path.join(self.metric_dir, f"{args.predict_time}_RMSE.csv")
         self._create_dirs()
 
         self.logging_filter = LogFlagFilter(True)
@@ -105,7 +105,7 @@ class Aurora_trainer:
 
         # codebook settings
         self.codebook_size = 4096
-        self.codebook_path = args.codebook_path
+        self.dictionary_path = args.dictionary_path
 
         # Aurora Model setting
         self.vars = {
@@ -327,7 +327,7 @@ class Aurora_trainer:
         try:
             self.logger.info(f"Loading Dictionary")
 
-            file_ext = os.path.splitext(self.codebook_path)[1].lower()
+            file_ext = os.path.splitext(self.dictionary_path)[1].lower()
             codebook_tensor = None
 
             """
@@ -337,13 +337,13 @@ class Aurora_trainer:
 
             if file_ext == '.npy':
                 # Direct .npy file (k-means codebook from k_means.py)
-                kmeans_array = np.load(self.codebook_path) # codebook_size, dim
+                kmeans_array = np.load(self.dictionary_path) # codebook_size, dim
                 # Convert numpy array to torch tensor
                 codebook_tensor = torch.from_numpy(kmeans_array).float()
 
             else:
                 # .pth checkpoint file (trained codebook from BackboneSoftVQ_trainer)
-                checkpoint = torch.load(self.codebook_path, map_location='cpu', weights_only=False)
+                checkpoint = torch.load(self.dictionary_path, map_location='cpu', weights_only=False)
 
                 # Find codebook tensor with robust search
                 if isinstance(checkpoint, dict):
@@ -405,7 +405,7 @@ class Aurora_trainer:
 
     def load_pass_resume_ckpt(self, checkpoint_path):
         stage1_codebook = None
-        if self.codebook_path and hasattr(self.model, 'vq_dconv') and hasattr(self.model.vq_dconv, 'D'):
+        if self.dictionary_path and hasattr(self.model, 'vq_dconv') and hasattr(self.model.vq_dconv, 'D'):
             stage1_codebook = self.model.vq_dconv.D.weight.clone().detach()
 
         checkpoint = torch.load(checkpoint_path, weights_only=False, map_location='cpu')
@@ -433,13 +433,13 @@ class Aurora_trainer:
         self.model = self.make_model()
         self.merge_unload_lora(self.model)
 
-        if self.codebook_path is not None:
+        if self.dictionary_path is not None:
             self._load_codebook()
 
-        if self.test_checkpoint_path:
-            self.load_pass_resume_ckpt(self.test_checkpoint_path)
+        if self.checkpoint_path:
+            self.load_pass_resume_ckpt(self.checkpoint_path)
         else:
-            self.logger.warning("No test_checkpoint_path provided; using current model weights")
+            self.logger.warning("No checkpoint_path provided; using current model weights")
 
         if torch.cuda.is_available():
             self.model = self.model.to('cuda')
@@ -509,7 +509,7 @@ class Aurora_trainer:
         self._init_model_for_testing()
 
         # build test loader
-        self.test_dataset  = CWA_ignore_missing(data_path=self.args.data_dir, leadtime=self.leadtime, step=self.rollout_step, dataset_time_range=args.test_time, dev=False, dataset_time_type="use_hour", patch_size=4, whether_regrid=False, divergence_mode=None)
+        self.test_dataset  = CWA_ignore_missing(data_path=self.args.data_dir, leadtime=self.leadtime, step=self.rollout_step, dataset_time_range=args.predict_time, dev=False, dataset_time_type="use_hour", patch_size=4, whether_regrid=False, divergence_mode=None)
 
         # default worker by fork
         self.test_loader = DataLoader(
@@ -523,10 +523,6 @@ class Aurora_trainer:
         )
 
         self.test_epoch()
-        if self.args.test_on_map == True:
-            pass
-        else :
-            self.metric_rmse_gen_csv()
 
     def prepare_aurora_data_pair(self, batch_input, batch_label):
         current_times = []
@@ -662,8 +658,6 @@ class Aurora_trainer:
                     label = labels[step]
                     self.valid_count_per_batch.append(preds[step][2])
 
-                    # if self.args.test_on_map == True:
-
                     # choose 2022010100, it will plot 2022010100 + step * leadtime
                     # ex: leadtime = 6, step = 1, it will plot 2022010112
 
@@ -702,16 +696,18 @@ class Aurora_trainer:
                         if not os.path.exists(output_path):
                             os.makedirs(output_path, exist_ok=True)
 
-                        self.test_on_map(lat_plot, lon_plot, pred_v, gt_v, f"{vname.upper()} - {this_date}", fname)
+                        self.test_on_map(
+                            lat_plot,
+                            lon_plot,
+                            pred_v,
+                            gt_v,
+                            title=vname.upper(),
+                            fname=fname,
+                            config={"title": vname.upper()},
+                            forecast_time=this_date,
+                        )
 
-                del test_input, test_labels, input, labels, preds
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-            mean_valid = sum(self.valid_count_per_batch) / len(self.valid_count_per_batch)
-
-    def test_on_map(self, lat, lon, pred, gt, title, fname, vmin=None, vmax=None):
+    def test_on_map(self, lat, lon, pred, gt, title, fname, vmin=None, vmax=None, config=None, forecast_time=None):
 
         lat = np.array(lat)
         lon = np.array(lon)
@@ -745,17 +741,19 @@ class Aurora_trainer:
         axes[1].set_title(labels[1])
         axes[2].set_title(labels[2])
 
-        cax_pred = fig.add_axes([0.15, 0.12, 0.18, 0.02])
-        cax_gt   = fig.add_axes([0.41, 0.12, 0.18, 0.02])
-        cax_diff = fig.add_axes([0.67, 0.12, 0.18, 0.02])
+        # Attach colorbars to each subplot so they never overlap the map panels,
+        # even when bbox_inches="tight" changes the final crop.
+        fig.colorbar(im_pred, ax=axes[0], orientation="horizontal", pad=0.06, fraction=0.046)
+        fig.colorbar(im_gt,   ax=axes[1], orientation="horizontal", pad=0.06, fraction=0.046)
+        fig.colorbar(im_diff, ax=axes[2], orientation="horizontal", pad=0.06, fraction=0.046)
 
-        fig.colorbar(im_pred, cax=cax_pred, orientation='horizontal')
-        fig.colorbar(im_gt,   cax=cax_gt,   orientation='horizontal')
-        fig.colorbar(im_diff, cax=cax_diff, orientation='horizontal')
+        if config is not None and forecast_time is not None:
+            plt.suptitle(f"{config['title']} - {forecast_time}", fontsize=18, fontweight="bold")
+        else:
+            fig.suptitle(title, fontsize=20, fontweight="bold")
 
-        fig.suptitle(title, fontsize=20, fontweight="bold")
-
-        fig.subplots_adjust(top=0.86, wspace=0.15, left=0.02, right=0.98)
+        # Reserve a bit more bottom margin for horizontal colorbars.
+        fig.subplots_adjust(top=0.86, bottom=0.12, wspace=0.15, left=0.02, right=0.98)
         fig.savefig(fname, dpi=150, bbox_inches="tight")
         plt.close()
 
@@ -828,11 +826,10 @@ class Aurora_trainer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--test_checkpoint_path', type = str, default = None, help='optional for only_test mode (the path needs to .pth) (will use official model if not provided)')
-    parser.add_argument('--test_time', required=True, nargs='+', type=str, help='List of years, e.g. --years 2021 2022 2023 / 202101 202102 202103')
-    parser.add_argument('--root_dir', type = str, help = "root dir path of the dataset", required=True)
+    parser.add_argument('--dictionary_path', type=str, default=None)
+    parser.add_argument('--checkpoint_path', type = str, default = None, help='optional for only_test mode (the path needs to .pth) (will use official model if not provided)')
+    parser.add_argument('--predict_time', required=True, nargs='+', type=str, help='List of years, e.g. --years 2021 2022 2023 / 202101 202102 202103')
     parser.add_argument('--data_dir', type = str, help = "root dir path of the dataset", required=True)
-    parser.add_argument('--codebook_path', type=str, default=None)
     args = parser.parse_args()
     trainer = Aurora_trainer(args)
     trainer.main_process()
