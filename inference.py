@@ -663,18 +663,21 @@ class Aurora_trainer:
 
                     lat_plot = lat.numpy()
                     lon_plot = lon.numpy()
+                    # Match the variable naming / title style used in
+                    # Taiwan-Aurora-Foundation-Model/plot/plot_hrrr_zero_shot.py
                     draw_vars_setting = {
-                        "2t": ("surf_vars", kelvin_to_celsius, None),
-                        "10u": ("surf_vars", None, None),
-                        "t850": ("atmos_vars", kelvin_to_celsius, 850),
-                        "z500": ("atmos_vars", geopotential_to_height, 500),
+                        "2t": ("surf_vars", kelvin_to_celsius, None, "Temperature at 2m (°C)"),
+                        "10u": ("surf_vars", None, None, "U-wind at 10m (m/s)"),
+                        "t850": ("atmos_vars", kelvin_to_celsius, 850, "Temperature at 850 hPa (°C)"),
+                        "z500": ("atmos_vars", geopotential_to_height, 500, "Geopotential Height at 500 hPa (m)"),
                     }
 
-                    for vname, (vtype, convert_method, target_level) in draw_vars_setting.items():
+                    for vname, (vtype, convert_method, target_level, plot_title) in draw_vars_setting.items():
 
                         if vtype == "surf_vars":
                             pred_v = pred.surf_vars[vname][0, 0].cpu().detach().numpy()
                             gt_v   = label.surf_vars[vname][0, 0].cpu().detach().numpy()
+                            level_idx = None
 
                         else:
                             levels = np.array(self.atmos_levels)
@@ -683,6 +686,7 @@ class Aurora_trainer:
 
                             pred_v = pred.atmos_vars[key][0, 0, idx_lv].cpu().detach().numpy()
                             gt_v   = label.atmos_vars[key][0, 0, idx_lv].cpu().detach().numpy()
+                            level_idx = int(idx_lv)
 
                         if convert_method:
                             pred_v = convert_method(pred_v)
@@ -703,18 +707,42 @@ class Aurora_trainer:
                             gt_v,
                             title=vname.upper(),
                             fname=fname,
-                            config={"title": vname.upper()},
+                            config={"title": plot_title},
                             forecast_time=this_date,
+                            level_idx=level_idx,
+                            source_name="NuWa",
                         )
 
-    def test_on_map(self, lat, lon, pred, gt, title, fname, vmin=None, vmax=None, config=None, forecast_time=None):
+    def test_on_map(
+        self,
+        lat,
+        lon,
+        pred,
+        gt,
+        title,
+        fname,
+        vmin=None,
+        vmax=None,
+        config=None,
+        forecast_time=None,
+        level_idx=None,
+        source_name="NuWa",
+    ):
 
         lat = np.array(lat)
         lon = np.array(lon)
 
         fig, axes = plt.subplots(1, 3, figsize=(20, 6), subplot_kw={"projection": ccrs.PlateCarree()})
 
-        labels = ["Prediction", "Ground Truth", "Diff |Pred-GT|"]
+        # Mirror the subplot title style used in plot_hrrr_zero_shot.py
+        if level_idx is None:
+            labels = [f"Prediction ({source_name})", f"Ground Truth ({source_name})", "Difference |Pred - GT|"]
+        else:
+            labels = [
+                f"Prediction ({source_name}, level_idx={level_idx})",
+                f"Ground Truth ({source_name}, level_idx={level_idx})",
+                "Difference |Pred - GT|",
+            ]
         extent = [lon.min(), lon.max(), lat.min(), lat.max()] # refine the map to certain region like TW, USA
 
         for ax in axes:
