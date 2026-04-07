@@ -37,10 +37,10 @@ Please use the provided scripts to download ERA5 data. We focus on high-resoluti
 
 ```bash
 # Download static variables
-python download_era5_data/constant_download_era5.py --region tw
+python download_era5_data/constant_download_era5.py --region local
 
 # Download main variables
-python download_era5_data/download_era5.py --region tw --start YYYY/MM/DD --end YYYY/MM/DD
+python download_era5_data/download_era5.py --region local --start YYYY/MM/DD --end YYYY/MM/DD
 ```
 
 ---
@@ -51,5 +51,28 @@ You can run the high-resolution inference pipeline using the following scripts:
 
 * **Bash:**
 ```bash
-bash public_bash_scripts/NuWa_inference_custom_rollout_1hr.sh
+bash public_bash_scripts/forecasting.sh
 ```
+
+* **Direct CLI (recommended for custom runs):**
+```bash
+python inference.py \
+  --dictionary_path /path/to/codebook.pth \
+  --checkpoint_path /path/to/model_checkpoint.pth \
+  --data_dir /path/to/dataset_root \
+  --predict_time 2024010100
+```
+
+### CLI Arguments
+
+- **`--dictionary_path`**: Path to the codebook/dictionary weight file (`.pth`).
+  e.g. ./NuWa/Dictionary-4year.pth
+
+- **`--checkpoint_path`**: Path to the model checkpoint (`.pth`) used for inference.
+  e.g. ./NuWa/NuWa-1year.pth
+
+- **`--data_dir`**: Root directory of the dataset used by `inference.py`.
+
+- **`--predict_time`**: Forecast initialization time(s) in `YYYYMMDDHH`. This selects which time(s) to run and plot.
+  - Single time (one run): `--predict_time 2024010100`
+  - Time range (start and end): `--predict_time 2024010100 2024010300`

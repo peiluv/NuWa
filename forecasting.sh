@@ -6,7 +6,7 @@ python inference.py \
     --dictionary_path /scratch3/users/ylchou109/Pei_heng_weight/codebook/Codebook-4096Kmeans-1922_1_4year.pth \
     --checkpoint_path /scratch3/users/ylchou109/Allen_Backup_for_new_Global_MR/Allen_Taiwan-Aurora-Foundation-Model/Stage3/weights/cwa_ignore_missing_regrid/CWA_Stage3_LoRA_MR_2021_redo_fix_data_1mon/CWA_Stage3_LoRA_MR_2021_redo_fix_data_1mon_20.pth \
     --data_dir /scratch3/users/ylchou109/regrid_cwa \
-    --predict_time 2024010100 2024010106
+    --predict_time 2024010100
 
 
 # instructions:

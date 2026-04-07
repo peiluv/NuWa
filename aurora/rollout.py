@@ -37,7 +37,7 @@ def rollout(model: Aurora, batch: Batch, steps: int, leadtime: int = 6, batch_id
         # Return pred to caller first, and move pred to cpu, then return to execute the following codes
 
         # Add the appropriate history so the model can be run on the prediction.
-        
+
         # Each surface variable (k) has an updated tensor:
 		# Historical data shifted by one time step (oldest removed).
 	    # Latest prediction (v) appended as the newest time step.
@@ -52,5 +52,5 @@ def rollout(model: Aurora, batch: Batch, steps: int, leadtime: int = 6, batch_id
                 for k, v in pred.atmos_vars.items()
             },
         )
-        
+
 

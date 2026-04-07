@@ -747,10 +747,7 @@ class Aurora_trainer:
         fig.colorbar(im_gt,   ax=axes[1], orientation="horizontal", pad=0.06, fraction=0.046)
         fig.colorbar(im_diff, ax=axes[2], orientation="horizontal", pad=0.06, fraction=0.046)
 
-        if config is not None and forecast_time is not None:
-            plt.suptitle(f"{config['title']} - {forecast_time}", fontsize=18, fontweight="bold")
-        else:
-            fig.suptitle(title, fontsize=20, fontweight="bold")
+        plt.suptitle(f"{config['title']} - {forecast_time}", fontsize=18, fontweight="bold")
 
         # Reserve a bit more bottom margin for horizontal colorbars.
         fig.subplots_adjust(top=0.86, bottom=0.12, wspace=0.15, left=0.02, right=0.98)
