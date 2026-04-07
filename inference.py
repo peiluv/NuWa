@@ -22,9 +22,11 @@ import torch.utils.data as tud
 from aurora.model.aurora_vq import AuroraSmallWithVQ, AuroraWithVQ, AuroraHighResWithVQ
 from aurora import rollout
 from aurora.batch import Batch, Metadata
-from aurora.utils.metrics import my_rmse_val, my_mae_val
+from aurora.utils.metrics import rmse, mae
 from dataset import CWA_ignore_missing
 from torch.utils.checkpoint import checkpoint
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 
 # Force reset CUDA environment to avoid conflicts
 os.environ.pop("CUDA_DEVICE_ORDER", None)
@@ -595,19 +597,6 @@ class Aurora_trainer:
             "entropy_loss": entropy_loss,
         }
 
-        # Check for negative losses (warnings only, not batch-level logging)
-        # try:
-        #     reco_val = float(loss_dict.get('reco_loss', 0.0).item() if isinstance(loss_dict.get('reco_loss', 0.0), torch.Tensor) else loss_dict.get('reco_loss', 0.0))
-        #     vq_val = float(loss_dict.get('vq_loss', 0.0).item() if isinstance(loss_dict.get('vq_loss', 0.0), torch.Tensor) else loss_dict.get('vq_loss', 0.0))
-        #     if reco_val < 0:
-        #         self.logger.warning(f"[Val Batch {batch_idx}] Negative reconstruction loss: {reco_val:.3f}")
-        #     if vq_val < 0:
-        #         self.logger.warning(f"[Val Batch {batch_idx}] Negative VQ loss: {vq_val:.3f}")
-        #     if total_loss.item() < 0:
-        #         self.logger.warning(f"[Val Batch {batch_idx}] Negative total loss: {total_loss.item():.3f}")
-        # except Exception:
-        #     pass
-
         return loss_dict
 
     def test_epoch(self):
@@ -680,8 +669,6 @@ class Aurora_trainer:
 
                     lat_plot = lat.numpy()
                     lon_plot = lon.numpy()
-
-                    # ---------------- Variables to plot ----------------
                     draw_vars_setting = {
                         "2t": ("surf_vars", kelvin_to_celsius, None),
                         "10u": ("surf_vars", None, None),
@@ -758,7 +745,6 @@ class Aurora_trainer:
         axes[1].set_title(labels[1])
         axes[2].set_title(labels[2])
 
-        # ------------- Consistent bottom colorbars -------------
         cax_pred = fig.add_axes([0.15, 0.12, 0.18, 0.02])
         cax_gt   = fig.add_axes([0.41, 0.12, 0.18, 0.02])
         cax_diff = fig.add_axes([0.67, 0.12, 0.18, 0.02])
@@ -840,11 +826,9 @@ class Aurora_trainer:
             metadata=label.metadata,
         )
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_checkpoint_path', type = str, default = None, help='optional for only_test mode (the path needs to .pth) (will use official model if not provided)')
-    # parser.add_argument('--test_on_map', action='store_true', help='Use zero shot model')
     parser.add_argument('--test_time', required=True, nargs='+', type=str, help='List of years, e.g. --years 2021 2022 2023 / 202101 202102 202103')
     parser.add_argument('--root_dir', type = str, help = "root dir path of the dataset", required=True)
     parser.add_argument('--data_dir', type = str, help = "root dir path of the dataset", required=True)
