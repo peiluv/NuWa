@@ -19,14 +19,6 @@ from aurora.model.decoder import Perceiver3DDecoder
 from aurora.model.encoder import Perceiver3DEncoder
 from aurora.model.dora import DoRAMode
 from aurora.model.swin3d import BasicLayer3D, Swin3DTransformerBackbone
-
-# Import the AuroraVQ from CodeFormer
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../CodeFormer/basicsr/archs'))
-from vqgan_arch import AuroraVQ
-
-# Import the original Aurora classes
 from aurora.model.aurora import Aurora, AuroraSmall
 
 from .dconv_vq import VQDConv
@@ -34,6 +26,108 @@ from einops import rearrange
 import time
 
 __all__ = ["AuroraWithVQ", "AuroraSmallWithVQ"]
+
+# for Aurora 3D Vector Quantizer
+class AuroraVQ(nn.Module):
+    """Memory-optimized 3D Vector Quantizer for Aurora model.
+
+    This version uses batch processing and memory-efficient operations
+    to avoid OOM while maintaining full functionality.
+    """
+    def __init__(self, codebook_size=256, emb_dim=256, sigma=0.25, batch_size=1000):
+        super(AuroraVQ, self).__init__()
+        self.codebook_size = codebook_size  # number of embeddings
+        self.emb_dim = emb_dim  # dimension of embedding
+        self.sigma = sigma  # commitment cost used in loss term
+        self.batch_size = batch_size  # batch size for processing
+
+        # Initialize the codebook
+        self.embedding = nn.Embedding(self.codebook_size, self.emb_dim)
+        self.embedding.weight.data.uniform_(-1.0 / self.codebook_size, 1.0 / self.codebook_size)
+
+    def forward(self, z):
+        """
+        Memory-optimized forward pass with batch processing.
+        """
+        # Store original shape
+        B, L, D = z.shape
+        device = z.device
+        dtype = z.dtype
+
+        # Process in batches to avoid memory explosion
+        z_q_list = []
+        vq_loss_list = []
+        min_indices_list = []
+
+        # Pre-compute codebook norms once
+        codebook_norms = (self.embedding.weight ** 2).sum(1)  # (codebook_size,)
+
+        for i in range(0, L, self.batch_size):
+            end_idx = min(i + self.batch_size, L)
+            z_batch = z[:, i:end_idx, :]  # (B, batch_L, D)
+            z_batch_flat = z_batch.reshape(-1, D)  # (B*batch_L, D)
+            batch_L = z_batch_flat.shape[0]
+
+            # Compute distances efficiently
+            z_norms = (z_batch_flat ** 2).sum(dim=1, keepdim=True)  # (B*batch_L, 1)
+
+            # Use torch.cdist for memory-efficient distance computation
+            distances = torch.cdist(z_batch_flat, self.embedding.weight, p=2) ** 2  # (B*batch_L, codebook_size)
+
+            # Find closest encodings
+            min_indices = torch.argmin(distances, dim=1)  # (B*batch_L,)
+
+            # Get quantized vectors directly using embedding lookup (more memory efficient)
+            z_q_batch_flat = self.embedding(min_indices)  # (B*batch_L, D)
+            z_q_batch = z_q_batch_flat.view(B, end_idx-i, D)  # (B, batch_L, D)
+
+            # Compute VQ loss for this batch
+            vq_loss_batch = torch.mean((z_q_batch.detach() - z_batch)**2) + \
+                           self.sigma * torch.mean((z_q_batch - z_batch.detach()) ** 2)
+
+            z_q_list.append(z_q_batch)
+            vq_loss_list.append(vq_loss_batch)
+            min_indices_list.append(min_indices)
+
+        # Concatenate results
+        z_q = torch.cat(z_q_list, dim=1)  # (B, L, D)
+        vq_loss = torch.mean(torch.stack(vq_loss_list))
+        min_encoding_indices = torch.cat(min_indices_list, dim=0)  # (B*L,)
+
+        # Apply Straight-Through Estimator to preserve gradients
+        z_q = z + (z_q - z).detach()
+
+        # Compute perplexity efficiently
+        min_indices_flat = min_encoding_indices.view(-1)
+        unique_indices, counts = torch.unique(min_indices_flat, return_counts=True)
+        probs = torch.zeros(self.codebook_size, device=device, dtype=dtype)
+        probs[unique_indices] = counts.float() / min_indices_flat.shape[0]
+        perplexity = torch.exp(-torch.sum(probs * torch.log(probs + 1e-10)))
+
+        # Compute mean distance efficiently
+        mean_distance = vq_loss  # Use VQ loss as approximation
+
+        # Prepare statistics (avoid storing large tensors)
+        stats = {
+            "perplexity": perplexity,
+            "min_encoding_indices": min_encoding_indices.unsqueeze(1),  # Keep shape consistent
+            "mean_distance": mean_distance,
+            # Remove min_encodings to save memory
+        }
+
+        return z_q, vq_loss, stats
+
+    def get_codebook_feat(self, indices, shape):
+        """
+        Memory-efficient codebook feature extraction.
+        """
+        # Direct embedding lookup (most memory efficient)
+        z_q = self.embedding(indices.view(-1))  # (B*L, D)
+
+        if shape is not None:
+            z_q = z_q.view(shape)
+
+        return z_q
 
 
 class AuroraWithVQ(Aurora):
@@ -77,7 +171,6 @@ class AuroraWithVQ(Aurora):
         self.lambda_generator_type = lambda_generator_type
 
         # Learnable scaling factor for RD mixing (lambda_rd)
-        # Initialize with s_init = logit(lambda_rd) so that sigmoid(s_init) == lambda_rd
         _lambda_rd = float(lambda_rd)
         _lambda_rd = max(1e-6, min(1.0 - 1e-6, _lambda_rd)) # 1e-6 ~ 1
         s_init = torch.logit(torch.tensor(_lambda_rd, dtype=torch.float32))
@@ -90,16 +183,6 @@ class AuroraWithVQ(Aurora):
             sigma=vq_sigma,
         )
 
-        # MLP
-        
-
-
-        # 2026/1/21 code review can remove
-
-        # Add normalization layer only
-        # Pre-VQ normalization (Not using in forward)
-        # 1st stage
-         # 2026/1/21 code review can remove
         self.pre_vq_norm = torch.nn.LayerNorm(self.encoder.embed_dim, eps=1e-6)
 
         # NOTE: The learnable fusion weight parameter is named lambda_rd
@@ -114,59 +197,11 @@ class AuroraWithVQ(Aurora):
             args=self.args
         )
 
-        if enable_lambda_generator:
-            print(f"[Info] Use Lambda Generator")
-            self.lambda_rd = None
-        else :
-            print(f"[Info] Use Lambda RD")
-
-        
         self.zvq_project_layer = nn.Sequential(
             nn.Linear(256, 512),
             nn.GELU(),
             nn.Linear(512, 256),
         )
-
-    # def _get_rd_fusion_target_dim(self) -> int:
-    #     """Return the feature dim of the RD fusion location (target_dim)."""
-        
-    #     where_code = getattr(self.args, 'where_code', 'backbone_decoder')
-
-    #     if where_code == "encoder_output":
-    #         return int(self.encoder.embed_dim)
-    #     elif where_code == "backbone_middle":
-    #         num_encoder_layers = len(self.backbone.encoder_layers)
-    #         return int(self.backbone.embed_dim * (2 ** (num_encoder_layers - 1)))
-    #     elif where_code == "backbone_decoder":
-    #         return int(self.backbone.embed_dim)
-    #     else:
-    #         # Keep backward compatibility: unknown values fall back to backbone_decoder
-    #         return int(self.backbone.embed_dim)
-
-
-    # def _build_zvq_project_layer(self) -> None:
-
-    #     vq_output_dim = int(self.encoder.embed_dim)
-    #     target_dim = int(self._get_rd_fusion_target_dim())
-    #     self._fusion_target_dim = target_dim
-
-    #     if vq_output_dim == target_dim:
-    #         # Scenario A: dims match, still enforce d -> 2d -> d
-    #         hidden_dim = 2 * vq_output_dim
-    #         self.zvq_project_layer = nn.Sequential(
-    #             nn.Linear(vq_output_dim, hidden_dim),
-    #             nn.GELU(),
-    #             nn.Linear(hidden_dim, target_dim),
-    #         )
-    #     else:
-    #         # Scenario B: dims differ, enforce 2-layer with hidden ~= geometric mean
-    #         hidden_dim = int((vq_output_dim * target_dim) ** 0.5)
-    #         hidden_dim = max(1, self._round_to_multiple(hidden_dim, multiple=64))
-    #         self.zvq_project_layer = nn.Sequential(
-    #             nn.Linear(vq_output_dim, hidden_dim),
-    #             nn.GELU(),
-    #             nn.Linear(hidden_dim, target_dim),
-    #         )
 
     def forward(self, batch: Batch, leadtime: int = 24, batch_idx = 0) -> tuple[Batch, torch.Tensor, dict]:
         """Forward pass with VQ integration."""
@@ -204,17 +239,7 @@ class AuroraWithVQ(Aurora):
         )
         c1, h, w = patch_res
         x_reshaped = rearrange(latent_feat, 'b (h w c1) c2 -> b (c1 c2) h w', c1=c1, h=h, w=w)
-
-        if self.args.count_time :
-            start = time.perf_counter()
-
-
         vq_out = self.vq_dconv(x_reshaped, batch_idx=batch_idx)
-
-        if self.args.count_time :
-            end = time.perf_counter()
-            print(f"prepare batch dataset: {end - start:.6f} 秒")
-
 
 
         if isinstance(vq_out, (tuple, list)):
@@ -236,21 +261,12 @@ class AuroraWithVQ(Aurora):
         # [3, 30284, 256]
         if lambda_rd_dynamic is not None: # have lambda generator
             lambda_rd_to_use = lambda_rd_dynamic
-            # print(f"[Info] in aurora vq, lamda_rd_to_use is from lambda generator")
         elif hasattr(self, 'lambda_rd') and self.lambda_rd is not None:
             lambda_rd_to_use = self.lambda_rd
-            # print(f"[Info] in aurora vq, lamda_rd_to_use is from lambda rd")
         else:
             lambda_rd_to_use = None
 
-        ### 
-             # 2026/1/21 code review
-             # wait for projection layer
-        ###
-        if self.args.use_zvq_project_layer:
-            z_vq = self.zvq_project_layer(z_vq)
-            # print(f"z_vq.shape = {z_vq.shape}")
-
+        z_vq = self.zvq_project_layer(z_vq)
         self.last_encoder_output = latent_feat
         self.last_dict_output = z_vq
         vq_loss = torch.tensor(0.0, device=latent_feat.device)
@@ -268,10 +284,6 @@ class AuroraWithVQ(Aurora):
             else:
                 lambda_rd_scalar = float(lambda_rd_to_use)
 
-
-        """
-            dconv_stats -> vq_stats
-        """
         try:
             if isinstance(dconv_stats, dict) and ('indices_hw' in dconv_stats):
                 idx_hw = dconv_stats['indices_hw']  # (B, h, w)
@@ -330,8 +342,6 @@ class AuroraWithVQ(Aurora):
          # ---- multi-resolution branch (GFP-GAN style) ----
         C_full, Hp_full, Wp_full = patch_res
         L_full = C_full * Hp_full * Wp_full
-
-        # print(f"in Aurora Model forward, multi_latents len = {len(multi_latents)}")
         multi_preds = []
 
         latent_patch_res_list = [
@@ -340,8 +350,6 @@ class AuroraWithVQ(Aurora):
         ]
 
         for i, latent in enumerate(multi_latents):  # use only the first one
-            # print("latent.shape =", latent.shape)
-
             d_1_2 = latent.shape[2] // 2
 
             latent_x = latent[..., :d_1_2]
@@ -352,33 +360,22 @@ class AuroraWithVQ(Aurora):
             latent_skip = self.mr_proj_layers[i][1](latent_skip)
 
             latent = torch.cat([latent_x, latent_skip], dim=-1)
-
-
-            # print("latent.shape after projection =", latent.shape)
-
-
             B, L_low, D = latent.shape
-            # print(f"full patch_res = {patch_res}")
-            # print(f"L_full = {L_full}")
 
             # infer spatial scale from token ratio
             ratio = L_full // L_low           # e.g. 118272 / 29568 = 4
             scale = int(math.sqrt(ratio))     # → 2 (so spatial scale = 1/2)
 
             # assert scale * scale == ratio, f"Non-square scale factor: ratio={ratio}"
-
             Hp_low = Hp_full // scale         # 132 / 2 = 66
             Wp_low = Wp_full // scale         # 224 / 2 = 112
 
             latent_patch_res = latent_patch_res_list[i]
-
-            # print(f"latent_patch_res = {latent_patch_res}")
-
             pred_low = self.decoder(
                 latent,
-                batch, # same as original resolution??
+                batch,
                 lead_time=timedelta(hours=6),
-                patch_res=latent_patch_res,    # how many patches in this resolution
+                patch_res=latent_patch_res,
             )
 
             # same post-processing as you already do
@@ -393,12 +390,7 @@ class AuroraWithVQ(Aurora):
             )
             # pred_low = pred_low.unnormalise(surf_stats=self.surf_stats)
 
-            # print(f"Intermediate pred {i} surf_vars['2t'].shape =", pred_low.surf_vars["2t"].shape)
             multi_preds.append(pred_low)
-
-
-        # vq_loss absolutely == 0
-        #
 
         return pred, multi_preds, vq_loss, vq_stats, entropy_loss, valid_count
 
@@ -438,14 +430,10 @@ class AuroraWithVQ(Aurora):
             )
 
         self.vq_dconv.load_codebook_weights(emb)
-        print(f"Successfully loaded VQ codebook from {codebook_path}")
-
-    # Allen remove some method because they can be inherited
 
 # Pre-configured variants
 AuroraSmallWithVQ = partial(
     AuroraWithVQ,
-    # 繼承 AuroraSmall
     encoder_depths=(2, 6, 2),
     encoder_num_heads=(4, 8, 16),
     decoder_depths=(2, 6, 2),
@@ -455,16 +443,15 @@ AuroraSmallWithVQ = partial(
     use_lora=False,
     codebook_size=512,
     vq_sigma=0.25,
-    lambda_rd=0.8,  # RD-module alignment: default weighted mixing coefficient (fair initialization)
+    lambda_rd=0.8,
 )
 
 AuroraHighResWithVQ = partial(
     AuroraWithVQ,
     patch_size=10,
-    # 繼承 AuroraSmall
     encoder_depths=(6, 8, 8),
     decoder_depths=(8, 8, 6),
     codebook_size=512,
     vq_sigma=0.25,
-    lambda_rd=0.8,  # RD-module alignment: default weighted mixing coefficient (fair initialization)
+    lambda_rd=0.8,
 )

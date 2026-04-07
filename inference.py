@@ -19,14 +19,11 @@ import pandas as pd
 from skimage.transform import resize
 from peft import LoraConfig, get_peft_model
 import torch.utils.data as tud
-
 from aurora.model.aurora_vq import AuroraSmallWithVQ, AuroraWithVQ, AuroraHighResWithVQ
-
 from aurora import rollout
 from aurora.batch import Batch, Metadata
 from aurora.utils.metrics import my_rmse_val, my_mae_val
-
-from dataset_cwa_ignore_missing import CWA_ignore_missing
+from dataset import CWA_ignore_missing
 from torch.utils.checkpoint import checkpoint
 
 # Force reset CUDA environment to avoid conflicts
@@ -67,11 +64,9 @@ class LogFlagFilter(logging.Filter):
 class Aurora_trainer:
     def __init__(self, args=None):
         self.args = args
-
-        # paths
+        self.valid_count_per_batch = []
         self.root_dir = self.args.root_dir
         self.tranditional_model_leadtime = 4
-
         self.test_checkpoint_path = self.args.test_checkpoint_path
 
         # Prefer checkpoint filename for inference prefix; fallback to codebook
@@ -86,12 +81,12 @@ class Aurora_trainer:
             self.file_prefix = "test_default"
 
         self.log_dir = f"{self.root_dir}/logs" ### need model name or it will conflate
-        self.saved_model_dir = f"{self.root_dir}/weights/{self.file_prefix}" ### need model name or it will conflate
+        self.saved_model_dir = f"{self.root_dir}/weights/" ### need model name or it will conflate
         self.metric_dir = f"{self.root_dir}/metrics/" ### need model name or it will conflate
-        self.test_on_map_dir = f"{self.root_dir}/plot/{self.file_prefix}"
+        self.test_on_map_dir = f"{self.root_dir}/plot/"
 
-        self.log_file_name = os.path.join(self.log_dir, f"{self.file_prefix}.log")
-        self.metric_file_name_rmse = os.path.join(self.metric_dir, f"{self.file_prefix}_RMSE.csv")
+        self.log_file_name = os.path.join(self.log_dir, f"{args.test_time}.log")
+        self.metric_file_name_rmse = os.path.join(self.metric_dir, f"{args.test_time}_RMSE.csv")
         self._create_dirs()
 
         self.logging_filter = LogFlagFilter(True)
@@ -109,7 +104,6 @@ class Aurora_trainer:
         # codebook settings
         self.codebook_size = 4096
         self.codebook_path = args.codebook_path
-        self.codebook_projection = None # Codebook projection layer (for 13B -> Small transfer)
 
         # Aurora Model setting
         self.vars = {
@@ -124,14 +118,10 @@ class Aurora_trainer:
             1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50
         ]
 
-        self.selected_channel = tuple(self.args.div_channel) # horizontal
-
-        # Stage1 Parameter
         # VQVAE settings : will not alter
         self.vq_sigma = 0.25
-        self.softvq_tau = 0.25 # stage1 initialized
+        self.softvq_tau = 0.25
         self.softvq_entropy_ratio = 0.15
-        # Align SoftVQ defaults with stage-1
         self.softvq_show_usage = True
         self.softvq_l2_norm = True
         self.softvq_chunk_size_tokens = 1024
@@ -164,7 +154,7 @@ class Aurora_trainer:
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir, exist_ok=True)
 
-        if not os.path.exists(self.test_on_map_dir) and self.args.mode == "testing":
+        if not os.path.exists(self.test_on_map_dir):
             os.makedirs(self.test_on_map_dir, exist_ok=True)
 
         if not os.path.exists(self.metric_dir):
@@ -277,17 +267,6 @@ class Aurora_trainer:
 
     # initial model without ckpt
     def make_model(self, load_optimizer_state=False):
-        """Load base model with official weights and load codebook.
-        Note: LoRA merging will be handled separately in load_aurora_ckpt_weight.
-
-        Args:
-            log_flag: Whether to log information
-            load_optimizer_state: Whether to load optimizer state (unused, kept for compatibility)
-            load_weights: Whether to load official pretrained weights (default: True)
-        """
-
-
-        self.logger.info("Using Aurora Small with SoftVQ ")
         model = AuroraSmallWithVQ(
             codebook_size=self.codebook_size,
             vq_sigma=self.vq_sigma,
@@ -302,7 +281,6 @@ class Aurora_trainer:
         ).to('cpu')
 
         self.official_checkpoint_name = "aurora-0.25-small-pretrained.ckpt"
-        self.logger.info(f"Loading official pretrained weights: {self.official_checkpoint_name}")
         missing_key, unexpected_key = model.load_checkpoint("microsoft/aurora", self.official_checkpoint_name, strict=False)
         missing_key = [key for key in missing_key if ("mr_proj_layers" not in key) and ("vq" not in key)]
         self.logger.info(f"official missing key = {missing_key}")
@@ -318,7 +296,6 @@ class Aurora_trainer:
 
     def packaged_by_lora(self, model):
         # set the peft_config based on method selection
-        self.logger.info("Using Lora Backbone Decoder with upsample")
         encoder_lora = LoraConfig(
             r=128,
             lora_alpha=256,
@@ -346,7 +323,7 @@ class Aurora_trainer:
     def _load_codebook(self):
 
         try:
-            self.logger.info(f"Loading first stage codebook from: {self.codebook_path}")
+            self.logger.info(f"Loading Dictionary")
 
             file_ext = os.path.splitext(self.codebook_path)[1].lower()
             codebook_tensor = None
@@ -358,23 +335,12 @@ class Aurora_trainer:
 
             if file_ext == '.npy':
                 # Direct .npy file (k-means codebook from k_means.py)
-                self.logger.info("Detected .npy file format (k-means codebook). Loading directly...")
                 kmeans_array = np.load(self.codebook_path) # codebook_size, dim
                 # Convert numpy array to torch tensor
                 codebook_tensor = torch.from_numpy(kmeans_array).float()
 
-                self.logger.info(f"Loaded k-means codebook from .npy file. Shape: {codebook_tensor.shape}")
-                self.logger.info(f"K-means codebook statistics: mean={kmeans_array.mean():.4f}, std={kmeans_array.std():.4f}, min={kmeans_array.min():.4f}, max={kmeans_array.max():.4f}")
-
-                # Infer codebook source based on embedding dimension
-                if codebook_tensor.shape[1] == 512:
-                    self.logger.info("Detected Aurora 13B k-means codebook (e_dim=512) from decoder-stage tokens.")
-                elif codebook_tensor.shape[1] == 256:
-                    self.logger.info("Detected AuroraSmall k-means codebook (e_dim=256) from decoder-stage tokens.")
-
             else:
                 # .pth checkpoint file (trained codebook from BackboneSoftVQ_trainer)
-                self.logger.info("Detected .pth checkpoint file format. Extracting codebook from checkpoint...")
                 checkpoint = torch.load(self.codebook_path, map_location='cpu', weights_only=False)
 
                 # Find codebook tensor with robust search
@@ -386,13 +352,11 @@ class Aurora_trainer:
                         # Check for SoftVQ embedding (from BackboneSoftVQ_trainer)
                         if 'aurora_vq.softvq.embedding' in container and isinstance(container['aurora_vq.softvq.embedding'], torch.Tensor):
                             codebook_tensor = container['aurora_vq.softvq.embedding']
-                            self.logger.info("Found codebook at: aurora_vq.softvq.embedding")
                             break
 
                         # Check for standard VQ embedding
                         if 'aurora_vq.embedding.weight' in container and isinstance(container['aurora_vq.embedding.weight'], torch.Tensor):
                             codebook_tensor = container['aurora_vq.embedding.weight']
-                            self.logger.info("Found codebook at: aurora_vq.embedding.weight")
                             break
 
                 if codebook_tensor is None:
@@ -426,16 +390,8 @@ class Aurora_trainer:
                 actual_e_dim = emb_2d.shape[1] # n, dim
 
                 if actual_e_dim == expected_e_dim:
-                    # AuroraSmall (256-dim) codebook: load directly and keep frozen
-
-                    self.logger.info(f"Detected AuroraSmall codebook (e_dim={actual_e_dim}). Loading directly without projection.")
-
                     # load into VQDConv D layer (codebook)
                     self.model.vq_dconv.load_codebook_weights(emb_2d)
-
-                    self.logger.info(f"Successfully loaded AuroraSmall codebook to VQDConv D layer. shape={tuple(emb_2d.shape)}")
-                    self.logger.info(f"Codebook statistics: mean={emb_2d.mean():.4f}, std={emb_2d.std():.4f}, min={emb_2d.min():.4f}, max={emb_2d.max():.4f}")
-                    self.logger.info("Codebook is frozen and only used for retrieval (original RD approach)")
 
             else:
                 self.logger.warning("Could not find codebook tensor in checkpoint or VQDConv not found")
@@ -449,7 +405,6 @@ class Aurora_trainer:
         stage1_codebook = None
         if self.codebook_path and hasattr(self.model, 'vq_dconv') and hasattr(self.model.vq_dconv, 'D'):
             stage1_codebook = self.model.vq_dconv.D.weight.clone().detach()
-            self.logger.info("[testing] Saved first stage codebook (VQDConv D layer) before loading checkpoint")
 
         checkpoint = torch.load(checkpoint_path, weights_only=False, map_location='cpu')
 
@@ -464,15 +419,10 @@ class Aurora_trainer:
 
         missing_key, unexpected_key = self.model.load_state_dict(filtered_state, strict=False)
 
-        self.logger.info(f"testing skip = {skipped}")
-        self.logger.info(f"testing missing_key = {missing_key}")
-        self.logger.info(f"testing unexpected_key = {unexpected_key}")
-
         # Restore first stage codebook to ensure correct codebook is used for inference
         if stage1_codebook is not None and hasattr(self.model, 'vq_dconv') and hasattr(self.model.vq_dconv, 'D'):
             with torch.no_grad():
                 self.model.vq_dconv.D.weight.copy_(stage1_codebook)
-            self.logger.info("[testing] Restored first stage codebook (VQDConv D layer) after loading checkpoint (ensuring correct codebook for inference)")
 
 
     def _init_model_for_testing(self):
@@ -485,16 +435,15 @@ class Aurora_trainer:
             self._load_codebook()
 
         if self.test_checkpoint_path:
-            self.logger.info(f"[testing] Loading final trained checkpoint: {self.test_checkpoint_path}")
             self.load_pass_resume_ckpt(self.test_checkpoint_path)
         else:
-            self.logger.warning("[testing] No test_checkpoint_path provided; using current model weights")
+            self.logger.warning("No test_checkpoint_path provided; using current model weights")
 
         if torch.cuda.is_available():
             self.model = self.model.to('cuda')
-            self.logger.info(f"[testing] Model moved to GPU: {torch.cuda.get_device_name(0)}")
+            self.logger.info(f"Model moved to GPU: {torch.cuda.get_device_name(0)}")
         else:
-            self.logger.info("[testing] CUDA not available, using CPU")
+            self.logger.info("CUDA not available, using CPU")
 
     def merge_unload_lora(self, this_model):
         self.logger.info("Lora Merge and Unload")
@@ -522,7 +471,6 @@ class Aurora_trainer:
 
             df[step+1]=metric_step
         df.to_csv(self.metric_file_name_rmse)
-        self.logger.info(f"RMSE metrics are saved at {self.metric_file_name_rmse}")
 
     def main_process(self):
         if torch.cuda.is_available():
@@ -545,7 +493,6 @@ class Aurora_trainer:
             torch.backends.cudnn.deterministic = True
             self.logger.info(f"Using GPU {os.environ.get('CUDA_VISIBLE_DEVICES')} : {torch.cuda.get_device_name(0)}")
             self.logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-            self.logger.info("Enabled TF32 acceleration")
 
         else:
             self.device = torch.device('cpu')
@@ -556,13 +503,11 @@ class Aurora_trainer:
         use_persistent = bool(optim_workers > 0)
         prefetch = 2 if optim_workers > 0 else None
 
-        self.logger.info("Testing Mode")
-
         # testing path: init model exactly like train (merge old lora -> attach fresh lora -> load final)
         self._init_model_for_testing()
 
         # build test loader
-        self.test_dataset  = CWA_ignore_missing(csv_file_path=self.args.cwa_csv_file_path, data_path=self.args.data_dir, leadtime=self.leadtime, step=self.rollout_step, dataset_time_range=args.test_time, dev=False, dataset_time_type="use_hour", patch_size=4, whether_regrid=False, divergence_mode=None)
+        self.test_dataset  = CWA_ignore_missing(data_path=self.args.data_dir, leadtime=self.leadtime, step=self.rollout_step, dataset_time_range=args.test_time, dev=False, dataset_time_type="use_hour", patch_size=4, whether_regrid=False, divergence_mode=None)
 
         # default worker by fork
         self.test_loader = DataLoader(
@@ -651,17 +596,17 @@ class Aurora_trainer:
         }
 
         # Check for negative losses (warnings only, not batch-level logging)
-        try:
-            reco_val = float(loss_dict.get('reco_loss', 0.0).item() if isinstance(loss_dict.get('reco_loss', 0.0), torch.Tensor) else loss_dict.get('reco_loss', 0.0))
-            vq_val = float(loss_dict.get('vq_loss', 0.0).item() if isinstance(loss_dict.get('vq_loss', 0.0), torch.Tensor) else loss_dict.get('vq_loss', 0.0))
-            if reco_val < 0:
-                self.logger.warning(f"[Val Batch {batch_idx}] Negative reconstruction loss: {reco_val:.3f}")
-            if vq_val < 0:
-                self.logger.warning(f"[Val Batch {batch_idx}] Negative VQ loss: {vq_val:.3f}")
-            if total_loss.item() < 0:
-                self.logger.warning(f"[Val Batch {batch_idx}] Negative total loss: {total_loss.item():.3f}")
-        except Exception:
-            pass
+        # try:
+        #     reco_val = float(loss_dict.get('reco_loss', 0.0).item() if isinstance(loss_dict.get('reco_loss', 0.0), torch.Tensor) else loss_dict.get('reco_loss', 0.0))
+        #     vq_val = float(loss_dict.get('vq_loss', 0.0).item() if isinstance(loss_dict.get('vq_loss', 0.0), torch.Tensor) else loss_dict.get('vq_loss', 0.0))
+        #     if reco_val < 0:
+        #         self.logger.warning(f"[Val Batch {batch_idx}] Negative reconstruction loss: {reco_val:.3f}")
+        #     if vq_val < 0:
+        #         self.logger.warning(f"[Val Batch {batch_idx}] Negative VQ loss: {vq_val:.3f}")
+        #     if total_loss.item() < 0:
+        #         self.logger.warning(f"[Val Batch {batch_idx}] Negative total loss: {total_loss.item():.3f}")
+        # except Exception:
+        #     pass
 
         return loss_dict
 
@@ -674,13 +619,6 @@ class Aurora_trainer:
 
         self.model = self.model.to(self.device)
         self.model.eval()
-
-        print(f"test show initial codebook")
-        for name, param in self.model.named_parameters():
-            if "vq_dconv.D" in name:
-                mean = param.data.mean().item()
-                std  = param.data.std(unbiased=False).item()
-                print(f"{name:60s}  mean={mean:.6e}  std={std:.6e}")
 
         with torch.inference_mode():
             for batch_idx, (test_input, test_labels) in enumerate(tqdm(self.test_loader, desc="Predicting", leave=False, ncols=100)):
@@ -735,63 +673,49 @@ class Aurora_trainer:
                     label = labels[step]
                     self.valid_count_per_batch.append(preds[step][2])
 
-                    if self.args.test_on_map == True:
+                    # if self.args.test_on_map == True:
 
-                        # choose 2022010100, it will plot 2022010100 + step * leadtime
-                        # ex: leadtime = 6, step = 1, it will plot 2022010112
+                    # choose 2022010100, it will plot 2022010100 + step * leadtime
+                    # ex: leadtime = 6, step = 1, it will plot 2022010112
 
-                        lat_plot = lat.numpy()
-                        lon_plot = lon.numpy()
+                    lat_plot = lat.numpy()
+                    lon_plot = lon.numpy()
 
-                        # ---------------- Variables to plot ----------------
-                        draw_vars_setting = {
-                            "2t": ("surf_vars", kelvin_to_celsius, None),
-                            "10u": ("surf_vars", None, None),
-                            "t850": ("atmos_vars", kelvin_to_celsius, 850),
-                            "z500": ("atmos_vars", geopotential_to_height, 500),
-                        }
+                    # ---------------- Variables to plot ----------------
+                    draw_vars_setting = {
+                        "2t": ("surf_vars", kelvin_to_celsius, None),
+                        "10u": ("surf_vars", None, None),
+                        "t850": ("atmos_vars", kelvin_to_celsius, 850),
+                        "z500": ("atmos_vars", geopotential_to_height, 500),
+                    }
 
-                        for vname, (vtype, convert_method, target_level) in draw_vars_setting.items():
+                    for vname, (vtype, convert_method, target_level) in draw_vars_setting.items():
 
-                            if vtype == "surf_vars":
-                                pred_v = pred.surf_vars[vname][0, 0].cpu().detach().numpy()
-                                gt_v   = label.surf_vars[vname][0, 0].cpu().detach().numpy()
+                        if vtype == "surf_vars":
+                            pred_v = pred.surf_vars[vname][0, 0].cpu().detach().numpy()
+                            gt_v   = label.surf_vars[vname][0, 0].cpu().detach().numpy()
 
-                            else:
-                                levels = np.array(self.atmos_levels)
-                                idx_lv = np.argmin(np.abs(levels - target_level))
-                                key = vname[0]   # t850 → t, z500 → z
+                        else:
+                            levels = np.array(self.atmos_levels)
+                            idx_lv = np.argmin(np.abs(levels - target_level))
+                            key = vname[0]   # t850 → t, z500 → z
 
-                                pred_v = pred.atmos_vars[key][0, 0, idx_lv].cpu().detach().numpy()
-                                gt_v   = label.atmos_vars[key][0, 0, idx_lv].cpu().detach().numpy()
+                            pred_v = pred.atmos_vars[key][0, 0, idx_lv].cpu().detach().numpy()
+                            gt_v   = label.atmos_vars[key][0, 0, idx_lv].cpu().detach().numpy()
 
-                            if convert_method:
-                                pred_v = convert_method(pred_v)
-                                gt_v = convert_method(gt_v)
+                        if convert_method:
+                            pred_v = convert_method(pred_v)
+                            gt_v = convert_method(gt_v)
 
-                            this_date = predict_times[step] + timedelta(hours=self.tranditional_model_leadtime)
-                            this_date = this_date.strftime("%Y-%m-%d_%H")
+                        this_date = predict_times[step] + timedelta(hours=self.tranditional_model_leadtime)
+                        this_date = this_date.strftime("%Y-%m-%d_%H")
 
-                            fname = f"{self.test_on_map_dir}/{this_date}/{vname}.png"
-                            # print(f"fname = {fname}")
-                            output_path = os.path.dirname(fname)
-                            if not os.path.exists(output_path):
-                                os.makedirs(output_path, exist_ok=True)
+                        fname = f"{self.test_on_map_dir}/{this_date}/{vname}.png"
+                        output_path = os.path.dirname(fname)
+                        if not os.path.exists(output_path):
+                            os.makedirs(output_path, exist_ok=True)
 
-                            self.test_on_map(lat_plot, lon_plot, pred_v, gt_v, f"{vname.upper()} - {this_date}", fname)
-
-                    else :
-                        step_metric_dict = {}
-                        step_metric_dict.update(my_rmse_val(pred, label, self.vars))
-
-                        for i in step_metric_dict.keys():
-                            if not self.mean_metric_per_step_rmse[step]:
-                                self.mean_metric_per_step_rmse[step] = step_metric_dict
-                            else:
-                                for k in self.vars['surf_vars']:
-                                    self.mean_metric_per_step_rmse[step][i]['surf_vars'][k] += step_metric_dict[i]['surf_vars'][k]
-                                for k in self.vars['atmos_vars']:
-                                    self.mean_metric_per_step_rmse[step][i]['atmos_vars'][k] += step_metric_dict[i]['atmos_vars'][k]
+                        self.test_on_map(lat_plot, lon_plot, pred_v, gt_v, f"{vname.upper()} - {this_date}", fname)
 
                 del test_input, test_labels, input, labels, preds
                 gc.collect()
@@ -799,7 +723,6 @@ class Aurora_trainer:
                     torch.cuda.empty_cache()
 
             mean_valid = sum(self.valid_count_per_batch) / len(self.valid_count_per_batch)
-            print("Mean valid count:", mean_valid)
 
     def test_on_map(self, lat, lon, pred, gt, title, fname, vmin=None, vmax=None):
 
@@ -812,10 +735,9 @@ class Aurora_trainer:
         extent = [lon.min(), lon.max(), lat.min(), lat.max()] # refine the map to certain region like TW, USA
 
         for ax in axes:
-
             ax.set_extent(extent, crs=ccrs.PlateCarree())
-            ax.add_feature(cfeature.COASTLINE, linewidth=0.6) # use Cartopy to draw coastline
-            ax.add_feature(cfeature.BORDERS, linewidth=0.4) # use Catropy to draw border between nation
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.4)
 
             gl = ax.gridlines(draw_labels=True, linewidth=0.3, color="gray", alpha=0.6)
             gl.top_labels = True
@@ -850,10 +772,8 @@ class Aurora_trainer:
         fig.subplots_adjust(top=0.86, wspace=0.15, left=0.02, right=0.98)
         fig.savefig(fname, dpi=150, bbox_inches="tight")
         plt.close()
-        print("[Saved]", fname)
 
-
-    def downsample_label(self, label: Batch, scale: float = 0.5) -> Batch: # scale 看要縮多小
+    def downsample_label(self, label: Batch, scale: float = 0.5) -> Batch:
         def resize_tensor(t: torch.Tensor, new_size, scale: float):
             """
             Resize tensor with anti-aliasing. Supports 3D, 4D, 5D tensors.
@@ -924,7 +844,7 @@ class Aurora_trainer:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_checkpoint_path', type = str, default = None, help='optional for only_test mode (the path needs to .pth) (will use official model if not provided)')
-    parser.add_argument('--test_on_map', action='store_true', help='Use zero shot model')
+    # parser.add_argument('--test_on_map', action='store_true', help='Use zero shot model')
     parser.add_argument('--test_time', required=True, nargs='+', type=str, help='List of years, e.g. --years 2021 2022 2023 / 202101 202102 202103')
     parser.add_argument('--root_dir', type = str, help = "root dir path of the dataset", required=True)
     parser.add_argument('--data_dir', type = str, help = "root dir path of the dataset", required=True)

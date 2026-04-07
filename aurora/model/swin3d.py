@@ -10,19 +10,14 @@ import itertools
 from datetime import timedelta
 from functools import lru_cache
 from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from timm.layers import DropPath, to_3tuple
-# from timm.models.layers import DropPath, to_3tuple
 from aurora.model.film import AdaptiveLayerNorm
 from aurora.model.fourier import lead_time_expansion
-# from aurora.model.dora import DoRAMode, DoRARollout
 from aurora.model.lora import LoRAMode, LoRARollout
-# from aurora.model.loha import LoHaMode, LoHaRollout
-# from aurora.model.lokr import LoKrMode, LoKrRollout
 from aurora.model.util import init_weights, maybe_adjust_windows
 from aurora.model.him import HIM, DConv
 
@@ -89,10 +84,7 @@ class WindowAttention(nn.Module):
         lora_alpha: int = 8,
         lora_dropout: float = 0.0,
         lora_steps: int = 40,
-        # lora_mode: DoRAMode = "single",
         lora_mode: LoRAMode = "single",
-        # lora_mode: LoHaMode = "single",
-        # lora_mode: LoKrMode = "single",
         use_lora: bool = False,
     ) -> None:
         """Initialise.
@@ -135,35 +127,9 @@ class WindowAttention(nn.Module):
             self.lora_qkv = LoRARollout(
                 dim, dim * 3, lora_r, lora_alpha, lora_dropout, lora_steps, lora_mode
             )
-            # self.dora_proj = DoRARollout(
-            #     self.proj, dim, dim, lora_r, lora_alpha, lora_dropout, lora_steps, lora_mode
-            # )
-            # self.dora_qkv = DoRARollout(
-            #     self.qkv, dim, dim * 3, lora_r, lora_alpha, lora_dropout, lora_steps, lora_mode
-            # )
-            # self.loha_proj = LoHaRollout(
-            #     dim, dim, lora_r, lora_alpha, lora_dropout, lora_steps, lora_mode
-            # )
-            # self.loha_qkv = LoHaRollout(
-            #     dim, dim * 3, lora_r, lora_alpha, lora_dropout, lora_steps, lora_mode
-            # )
-            # self.lokr_proj = LoKrRollout(
-            #     dim, dim, lora_r, lora_alpha, lora_dropout, lora_steps, lora_mode
-            # )
-            # self.lokr_qkv = LoKrRollout(
-            #     dim, dim * 3, lora_r, lora_alpha, lora_dropout, lora_steps, lora_mode
-            # )
         else:
-            # self.dora_proj = lambda *args, **kwargs: 0  # type: ignore
-            # self.dora_qkv = lambda *args, **kwargs: 0  # type: ignore
             self.lora_proj = lambda *args, **kwargs: 0  # type: ignore
             self.lora_qkv = lambda *args, **kwargs: 0  # type: ignore
-            # self.loha_proj = lambda *args, **kwargs: 0  # type: ignore
-            # self.loha_qkv = lambda *args, **kwargs: 0  # type: ignore
-            # self.lokr_proj = lambda *args, **kwargs: 0  # type: ignore
-            # self.lokr_qkv = lambda *args, **kwargs: 0  # type: ignore
-
-
 
     def forward(
         self,
@@ -183,11 +149,7 @@ class WindowAttention(nn.Module):
             torch.Tensor: Output of shape `(nW*B, N, C)`.
         """
 
-        # dora_weight_norm = get_weight_norm(self.qkv, self.lora_qkv)
-        # qkv = self.dora_qkv(x, rollout_step)
         qkv = self.qkv(x) + self.lora_qkv(x, rollout_step)
-        # qkv = self.qkv(x) + self.loha_qkv(x, rollout_step)
-        # qkv = self.qkv(x) + self.lokr_qkv(x, rollout_step)
         qkv = rearrange(qkv, "B N (qkv H D) -> qkv B H N D", H=self.num_heads, qkv=3)
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn_dropout = self.attn_drop if self.training else 0.0
@@ -202,10 +164,7 @@ class WindowAttention(nn.Module):
             x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_dropout)
 
         x = rearrange(x, "B H N D -> B N (H D)")
-        # x = self.dora_proj(x, rollout_step)
         x = self.proj(x) + self.lora_proj(x, rollout_step)
-        # x = self.proj(x) + self.loha_proj(x, rollout_step)
-        # x = self.proj(x) + self.lokr_proj(x, rollout_step)
         x = self.proj_drop(x)
         return x
 
@@ -418,9 +377,6 @@ class Swin3DTransformerBlock(nn.Module):
         scale_bias: float = 0.0,
         lora_steps: int = 40,
         lora_mode: LoRAMode = "single",
-        # lora_mode: DoRAMode = "single",
-        # lora_mode: LoHaMode = "single",
-        # lora_mode: LoKrMode = "single",
         use_lora: bool = False,
     ) -> None:
         """Initialise.
@@ -674,9 +630,6 @@ class BasicLayer3D(nn.Module):
         scale_bias: float = 0.0,
         lora_steps: int = 40,
         lora_mode: LoRAMode = "single",
-        # lora_mode: DoRAMode = "single",
-        # lora_mode: LoHaMode = "single",
-        # lora_mode: LoKrMode = "single",
         use_lora: bool = False,
     ) -> None:
         """Initialise.
@@ -813,9 +766,6 @@ class Swin3DTransformerBackbone(nn.Module):
         drop_path_rate: float = 0.1,
         lora_steps: int = 40,
         lora_mode: LoRAMode = "single",
-        # lora_mode: DoRAMode = "single",
-        # lora_mode: LoHaMode = "single",
-        # lora_mode: LoKrMode = "single",
         use_lora: bool = False,
         input_args = None
     ) -> None:
@@ -915,10 +865,6 @@ class Swin3DTransformerBackbone(nn.Module):
             bly.init_respostnorm()
         for bly in self.decoder_layers:
             bly.init_respostnorm()
-        ##############################################
-        # self.get_prior = DConv(in_channels=self.embed_dim*4)
-        # self.him = HIM(dim = self.embed_dim*4)
-        ##############################################
     def get_encoder_specs(
         self, patch_res: tuple[int, int, int]
     ) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
@@ -977,59 +923,33 @@ class Swin3DTransformerBackbone(nn.Module):
 
         skips = [] # full, 1/2, 1/4
 
-        
-        # print(f"before backbone encoder, x.shape = {x.shape}")
-
-        if freeze_stage2 == False and z_vq is not None and lambda_rd is not None and self.args.where_code == "backbone_encoder":
-            # RD fusion: F = sigmoid(lambda_rd) * x + (1 - sigmoid(lambda_rd)) * z_vq
-            # 處理不同類型的 lambda_rd（固定標量或動態生成）
-            if isinstance(lambda_rd, torch.Tensor):
-                if lambda_rd.dim() == 2:  # (B, 1) - MLP 或混合方案
-                    # print(f"[Debugging] use lambda rd as d2")
-                    scale_x = torch.sigmoid(lambda_rd).to(x.device)  # (B, 1)
-                    scale_x = scale_x.unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
-                elif lambda_rd.dim() == 4:  # (B, 1, H, W) - Conv 方案
-                    # 對空間維度求平均，轉換為 (B, 1)
-                    # print(f"[Debugging] use lambda rd as d4")
-                    scale_x = torch.sigmoid(lambda_rd.mean(dim=[2, 3])).to(x.device)  # (B, 1)
-                    scale_x = scale_x.unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
-                elif lambda_rd.dim() == 1:  # (B,) - 單維度  # 2026/1/21 code review this one, others can remove
-                    # print(f"[Debugging] use lambda rd as d1")
-                    scale_x = torch.sigmoid(lambda_rd).to(x.device).unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
-                elif lambda_rd.dim() == 0:  # scalar
-                    # print(f"[Debugging] use lambda rd as d0")
-                    scale_x = torch.sigmoid(lambda_rd).to(x.device)
-                else:
-                    # 其他情況：取平均
-                    scale_x = torch.sigmoid(lambda_rd.mean()).to(x.device)
+        # RD fusion: F = sigmoid(lambda_rd) * x + (1 - sigmoid(lambda_rd)) * z_vq
+        if isinstance(lambda_rd, torch.Tensor):
+            if lambda_rd.dim() == 2:
+                scale_x = torch.sigmoid(lambda_rd).to(x.device)  # (B, 1)
+                scale_x = scale_x.unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
+            elif lambda_rd.dim() == 4:
+                scale_x = torch.sigmoid(lambda_rd.mean(dim=[2, 3])).to(x.device)  # (B, 1)
+                scale_x = scale_x.unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
+            elif lambda_rd.dim() == 1:
+                scale_x = torch.sigmoid(lambda_rd).to(x.device).unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
+            elif lambda_rd.dim() == 0:
+                scale_x = torch.sigmoid(lambda_rd).to(x.device)
             else:
-                # 固定值（fallback）
-                # print(f"[Debugging] use lambda rd as else")
-                scale_x = torch.sigmoid(torch.tensor(lambda_rd, device=x.device))
-
-            
-
+                scale_x = torch.sigmoid(lambda_rd.mean()).to(x.device)
+        else:
+            scale_x = torch.sigmoid(torch.tensor(lambda_rd, device=x.device))
             scale_z = 1.0 - scale_x
-            # print(f"scale_x = {scale_x}, scale_z = {scale_z}")
             x = scale_x * x + scale_z * z_vq  # Shape: (B, L, D)
 
-            # print(f"[Debug] code insert at backbone encoder")
-
-
-            # print(f"in backbone decoder last layer, z_vq.shape = {x.shape}")
-                
         for i, layer in enumerate(self.encoder_layers): # 3
             x, x_unscaled = layer(x, c, all_enc_res[i], rollout_step=rollout_step)
 
-            # print(f"backbone encoder layer {i} : x.shape = {x.shape}, x_unscaled.shape = {x_unscaled.shape if hasattr(x_unscaled, 'shape') else x_unscaled}")
-
             if i == self.num_encoder_layers - 1 : # last layer
                 skips.append(x)
-            else : 
+            else :
                 skips.append(x_unscaled)
-            
-
-        intermediate_latents = []   # Superes: store multi-resolution outputs
+        intermediate_latents = []
 
         for i, layer in enumerate(self.decoder_layers):
             index = self.num_decoder_layers - i - 1 # 2 - i
@@ -1045,46 +965,30 @@ class Swin3DTransformerBackbone(nn.Module):
                 # For the intermediate stages, we use additive skip connections.
                 x = x + skips[index - 1] # x[0] + skip[2] x[1] + skip[1]
             elif i == self.num_decoder_layers - 1:
-                
+
                 # For the last stage, perform RD fusion before concatenation (if z_vq and lambda_rd are provided)
                 # At this point: x shape is (B, L, D), z_vq shape should be (B, L, D)
-                if freeze_stage2 == False and z_vq is not None and lambda_rd is not None and self.args.where_code == "backbone_decoder":
-                    # RD fusion: F = sigmoid(lambda_rd) * x + (1 - sigmoid(lambda_rd)) * z_vq
-                    # 處理不同類型的 lambda_rd（固定標量或動態生成）
-                    if isinstance(lambda_rd, torch.Tensor):
-                        if lambda_rd.dim() == 2:  # (B, 1) - MLP 或混合方案
-                            # print(f"[Debugging] use lambda rd as d2")
-                            scale_x = torch.sigmoid(lambda_rd).to(x.device)  # (B, 1)
-                            scale_x = scale_x.unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
-                        elif lambda_rd.dim() == 4:  # (B, 1, H, W) - Conv 方案
-                            # 對空間維度求平均，轉換為 (B, 1)
-                            # print(f"[Debugging] use lambda rd as d4")
-                            scale_x = torch.sigmoid(lambda_rd.mean(dim=[2, 3])).to(x.device)  # (B, 1)
-                            scale_x = scale_x.unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
-                        elif lambda_rd.dim() == 1:  # (B,) - 單維度
-                            # print(f"[Debugging] use lambda rd as d1")
-                            scale_x = torch.sigmoid(lambda_rd).to(x.device).unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
-                        elif lambda_rd.dim() == 0:  # scalar
-                            # print(f"[Debugging] use lambda rd as d0")
-                            scale_x = torch.sigmoid(lambda_rd).to(x.device)
-                        else:
-                            # 其他情況：取平均
-                            scale_x = torch.sigmoid(lambda_rd.mean()).to(x.device)
+
+                # RD fusion: F = sigmoid(lambda_rd) * x + (1 - sigmoid(lambda_rd)) * z_vq
+                if isinstance(lambda_rd, torch.Tensor):
+                    if lambda_rd.dim() == 2:  # (B, 1)
+                        scale_x = torch.sigmoid(lambda_rd).to(x.device)  # (B, 1)
+                        scale_x = scale_x.unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
+                    elif lambda_rd.dim() == 4:  # (B, 1, H, W)
+                        scale_x = torch.sigmoid(lambda_rd.mean(dim=[2, 3])).to(x.device)  # (B, 1)
+                        scale_x = scale_x.unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
+                    elif lambda_rd.dim() == 1:  # (B,)
+                        scale_x = torch.sigmoid(lambda_rd).to(x.device).unsqueeze(1).expand(x.shape[0], x.shape[1], 1)  # (B, L, 1)
+                    elif lambda_rd.dim() == 0:  # scalar
+                        scale_x = torch.sigmoid(lambda_rd).to(x.device)
                     else:
-                        # 固定值（fallback）
-                        # print(f"[Debugging] use lambda rd as else")
-                        scale_x = torch.sigmoid(torch.tensor(lambda_rd, device=x.device))
+                        scale_x = torch.sigmoid(lambda_rd.mean()).to(x.device)
+                else:
+                    scale_x = torch.sigmoid(torch.tensor(lambda_rd, device=x.device))
 
-                    
+                scale_z = 1.0 - scale_x
+                x = scale_x * x + scale_z * z_vq  # Shape: (B, L, D)
 
-                    scale_z = 1.0 - scale_x
-                    # print(f"scale_x = {scale_x}, scale_z = {scale_z}")
-                    x = scale_x * x + scale_z * z_vq  # Shape: (B, L, D)
-
-
-                    # print(f"in backbone decoder last layer, z_vq.shape = {x.shape}")
-                
-                
                 # For the last stage, we perform concatentation like in Pangu.
                 x = torch.cat([x, skips[0]], dim=-1)
 
@@ -1093,5 +997,5 @@ class Swin3DTransformerBackbone(nn.Module):
                 x_before_upsampling = torch.cat([x_before_upsampling, skips[index]], dim=-1)
                 intermediate_latents.append(x_before_upsampling)
                 # 1/4, 1/2
-        
+
         return x, intermediate_latents

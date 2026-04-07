@@ -5,11 +5,6 @@ from einops import rearrange
 from importlib import import_module
 import os
 
-# Import LambdaGenerator (default: LambdaGenerator - Hybrid version)
-_lambda_module = import_module(".lambda", __package__)
-LambdaGenerator = _lambda_module.LambdaGenerator
-LambdaGeneratorConv = _lambda_module.LambdaGeneratorConv
-
 class VQDConv(nn.Module):
     def __init__(self, in_channels, atoms=256, codebook_projection=None,
                  enable_lambda_generator=True, lambda_rd_init=0.8, args=None):
@@ -27,7 +22,6 @@ class VQDConv(nn.Module):
         self.in_channels = in_channels
 
         # kernel size == 1 => won't change the h, w
-
         # Channel compression: 1024 -> 256
         self.channel_compression = nn.Conv2d(in_channels, 256, 1)
 
@@ -50,20 +44,6 @@ class VQDConv(nn.Module):
         # Dynamic projection layer (for 13B codebook 512->256 projection)
         self.codebook_projection = codebook_projection
         self.original_codebook = None  # store original 512-dim codebook (if dynamic projection is used)
-
-        # Lambda Generator (dynamically generates lambda_rd)
-        # Default: LambdaGenerator (Hybrid) - multi-scale features with conditional information
-        self.enable_lambda_generator = enable_lambda_generator
-        if enable_lambda_generator:
-            self.lambda_generator = LambdaGenerator(in_channels=256, hidden_dim=64)
-            # Alternative: LambdaGeneratorConv (per-location conv version)
-            # Note: LambdaGeneratorConv's spatial adaptivity is lost in backbone fusion (averaged to scalar)
-            # self.lambda_generator = LambdaGeneratorConv(in_channels=256, hidden_dim=64)
-
-            # Initialize lambda_generator with given lambda_rd_init
-            self.lambda_generator.initialize_with_value(lambda_rd_init)
-        else:
-            self.lambda_generator = None
 
     def PONO(self, x):
         """Position Normalization - consistent with Dictionary-based modules"""
@@ -131,11 +111,6 @@ class VQDConv(nn.Module):
         # Adjust number of atoms to match self.atoms
         if n_codes != self.atoms:
 
-            # 2026/1/21 code review
-            # raise ValueError(
-            #     f"Unsupported codebook tensor shape: {tuple(codebook_tensor.shape)}."
-            # )
-
             if n_codes > self.atoms:
                 codebook_tensor = codebook_tensor[:self.atoms]
                 if self.original_codebook is not None:
@@ -194,8 +169,6 @@ class VQDConv(nn.Module):
 
         # Dynamically generate lambda_rd (using same features as CG)
         lambda_rd = None
-        if self.lambda_generator is not None:
-            lambda_rd = self.lambda_generator(x_compressed)
 
         # Dictionary-style retrieval pipeline
         x = self.CG(x_compressed)        # 256 -> atoms
@@ -208,92 +181,38 @@ class VQDConv(nn.Module):
         entropy_loss = 0.0
         valid_count = 0.0
 
-        if self.args.used_entropy == "entropy" :
+        # entropy first and select % next (teacher said)
+        entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1)  # (B, H, W)
+        entropy_loss = entropy.mean()
 
-            # entropy first and select % next (teacher said)
-            entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1)  # (B, H, W)
-            entropy_loss = entropy.mean()
+        B, C, H, W = probs.shape # C means atoms
 
-            B, C, H, W = probs.shape # C means atoms
+        # select top k % atoms
 
-            # select top k % atoms
+        k = max(1, int(C * 0.2)) # valid_atom_rate
+        topk_vals, topk_idx = torch.topk(probs, k=k, dim=1)
 
-            k = max(1, int(C * self.args.valid_atom_rate))
-            topk_vals, topk_idx = torch.topk(probs, k=k, dim=1)
-
-            mask = torch.zeros_like(probs)
-            mask.scatter_(1, topk_idx, 1.0) # dim, index, src
-            x = x * mask
-            probs = probs * mask
-            probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-9)
+        mask = torch.zeros_like(probs)
+        mask.scatter_(1, topk_idx, 1.0) # dim, index, src
+        x = x * mask
+        probs = probs * mask
+        probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-9)
 
 
 
-            # random sample a prob distibution to find how many atoms are used
-            b = torch.randint(0, B, (1,)).item()
-            h = torch.randint(0, H, (1,)).item()
-            w = torch.randint(0, W, (1,)).item()
-            pixel_probs = probs[b, :, h, w]   # shape: (C,)
-            sorted_probs, sorted_indices = torch.sort(pixel_probs, descending=True)
-            valid_count = (sorted_probs > 1e-4).sum().item()
-
-            
-
-
-
-        elif self.args.used_entropy == "l1" :
-            entropy_loss = x.abs().mean()  # shape: (B, H, W)
-            probs = torch.softmax(x, dim=1) # this is the true probability
-            
-            B, C, H, W = x.shape
-            k = max(1, int(C * self.args.valid_atom_rate))
-
-            topk_vals, topk_idx = torch.topk(x, k=k, dim=1)
-
-            mask = torch.zeros_like(x)
-            mask.scatter_(1, topk_idx, 1.0) # dim, index, src
-
-            x = x * mask
-            probs = probs * mask
-            probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-9)
-
-
-            b = torch.randint(0, B, (1,)).item()
-            h = torch.randint(0, H, (1,)).item()
-            w = torch.randint(0, W, (1,)).item()
-            pixel_x = probs[b, :, h, w]   # shape: (C,)
-            sorted_x, sorted_indices = torch.sort(pixel_x, descending=True)
-
-            # print("Sorted logit:")
-            # print(sorted_x[:50]) # 1e-4
-            # print("Class indices (high → low):")
-            # print(sorted_indices[:50])
-            valid_count = (sorted_x > 1e-4).sum().item()
-            # print("valid_count:", valid_count)
-
-            # how many use            
-
-        # record coefficient distribution
-        if self.args.record_coefficient_distribution : 
-            record_probs = probs.permute(0, 2, 3, 1).contiguous()
-            sorted_probs, _ = record_probs.sort(dim=-1, descending=True)
-
-            record_coefficient_distribution_dir = f"{self.args.root_dir}/analysis_atoms_log/{self.args.used_entropy}_{self.args.valid_atom_rate}/atoms_probs"
-            os.makedirs(record_coefficient_distribution_dir, exist_ok=True)
-            save_path = os.path.join(record_coefficient_distribution_dir, f"{batch_idx}.pt")
-            torch.save(sorted_probs.cpu(), save_path)
+        # random sample a prob distibution to find how many atoms are used
+        b = torch.randint(0, B, (1,)).item()
+        h = torch.randint(0, H, (1,)).item()
+        w = torch.randint(0, W, (1,)).item()
+        pixel_probs = probs[b, :, h, w]   # shape: (C,)
+        sorted_probs, sorted_indices = torch.sort(pixel_probs, descending=True)
+        valid_count = (sorted_probs > 1e-4).sum().item()
 
         # Build indices stats (argmax over softmax probabilities used only for logging)
         with torch.no_grad():
             indices = probs.argmax(dim=1).to(torch.int32)  # 3, 67, 113
             avg_probs = probs.mean()
             max_probs = probs.amax(dim=1).mean()
-
-            if self.args.record_atoms_choice : 
-                record_coefficient_distribution_dir = f"{self.args.root_dir}/analysis_atoms_log/{self.args.used_entropy}_{self.args.valid_atom_rate}/atoms_choice"
-                os.makedirs(record_coefficient_distribution_dir, exist_ok=True)
-                save_path = os.path.join(record_coefficient_distribution_dir, f"{batch_idx}.pt")
-                torch.save(indices.cpu(), save_path)
 
         # Dynamic projection mode: if using 13B codebook, project each forward
         if self.original_codebook is not None and self.codebook_projection is not None:

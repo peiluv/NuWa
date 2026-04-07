@@ -14,14 +14,10 @@ def lead_time_expansion(lead_times, embed_dim):
 class Swin3DTransformerBackboneWithVQ(Swin3DTransformerBackbone):
     def __init__(self, use_vq_dconv=False, vq_dconv_atoms=128, **kwargs):
         super().__init__(**kwargs)
-        # 按新架構：VQDConv 已移至 Encoder→Backbone 之間，backbone 不再進行任何區域混合
         self.use_vq_dconv = False
         self.vq_dconv_atoms = vq_dconv_atoms
 
     def forward(self, x, lead_time, patch_res, rollout_step=1):
-        # 新架構：Backbone 僅負責主幹表徵學習，不做任何 VQDConv/混合
-
-        # 原有的 Swin3D 處理流程
         all_enc_res, padded_outs = self.get_encoder_specs(patch_res)
 
         lead_hours = lead_time / timedelta(hours=1)
@@ -53,5 +49,4 @@ class Swin3DTransformerBackboneWithVQ(Swin3DTransformerBackbone):
         return x
 
     def load_vq_codebook(self, codebook_path: str):
-        # 新架構：codebook 載入由 AuroraWithVQ 外掛的 VQDConv 處理
         raise NotImplementedError("Backbone no longer manages VQDConv codebook. Use AuroraWithVQ.load_vq_codebook.")
