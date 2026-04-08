@@ -3,8 +3,6 @@ A Deep Learning Framework for High-Resolution Taiwan Weather Forecasting by Glob
 
 <img width="2326" height="1226" alt="image" src="https://github.com/user-attachments/assets/b5343db6-835b-4bea-8c59-31b3cb09c85e" />
 
-<img width="1832" height="560" alt="Gemini_Generated_Image_yul6h7yul6h7yul6" src="https://github.com/user-attachments/assets/9bc67f77-2211-4b1c-bab3-5bd38d817861" />
-
 ### Environment Setting
 
 We recommend using **Conda** to manage your environment. Follow these steps to set up the environment and resolve specific package compatibility issues.
