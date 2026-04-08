@@ -4,7 +4,7 @@ export CUDA_VISIBLE_DEVICES=$GPU
 
 python inference.py \
     --dictionary_path /scratch3/users/ylchou109/Pei_heng_weight/codebook/Codebook-4096Kmeans-1922_1_4year.pth \
-    --checkpoint_path /scratch3/users/ylchou109/data_transfer/CWA_Stage3_LoRA_MR_2021_redo_fix_data_1year_6.pth \
+    --checkpoint_path /scratch3/users/phchiang/NuWa/CWA_Stage3_LoRA_MR_2021_redo_fix_data_3year_3.pth \
     --data_dir /scratch3/users/ylchou109/regrid_cwa \
     --predict_time 2024010100
 

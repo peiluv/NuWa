@@ -17,13 +17,15 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 import pandas as pd
 from skimage.transform import resize
+from skimage.filters import gaussian as gaussian_filter
 from peft import LoraConfig, get_peft_model
 import torch.utils.data as tud
-from aurora.model.aurora_vq import AuroraSmallWithVQ, AuroraWithVQ, AuroraHighResWithVQ
+from aurora.model.aurora import AuroraSmall
+from aurora.model.aurora_vq import AuroraSmallWithVQ
 from aurora import rollout
 from aurora.batch import Batch, Metadata
 from aurora.utils.metrics import rmse, mae
-from dataset import CWA_ignore_missing
+from dataset import CWA_ignore_missing, Global_ERA5
 from torch.utils.checkpoint import checkpoint
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -68,7 +70,6 @@ class Aurora_trainer:
         self.args = args
         self.valid_count_per_batch = []
         self.root_dir = "./"
-        self.tranditional_model_leadtime = 4
         self.checkpoint_path = self.args.checkpoint_path
 
         # Prefer checkpoint filename for inference prefix; fallback to codebook
@@ -100,8 +101,6 @@ class Aurora_trainer:
         self.leadtime = 6
         self.rollout_step = 1
         self.batch_size = 3
-        self.global_step = 0
-        self.epoch = 0
 
         # codebook settings
         self.codebook_size = 4096
@@ -134,6 +133,12 @@ class Aurora_trainer:
         self.atmos_levels = []
         self.mean_metric_per_step_rmse = [{} for _ in range(self.rollout_step)]
         self.scaler = GradScaler()
+        # Lazy cache for ERA5→official pretrained Aurora baseline (used in test_on_map)
+        self._era5_baseline_ready = False
+        self._era5_baseline_dataset = None
+        self._era5_baseline_model = None
+        self._era5_baseline_device = None
+        self._era5_baseline_rollout_leadtime = 6
 
     @staticmethod
     def worker_init_fn(worker_id):
@@ -336,9 +341,7 @@ class Aurora_trainer:
             """
 
             if file_ext == '.npy':
-                # Direct .npy file (k-means codebook from k_means.py)
                 kmeans_array = np.load(self.dictionary_path) # codebook_size, dim
-                # Convert numpy array to torch tensor
                 codebook_tensor = torch.from_numpy(kmeans_array).float()
 
             else:
@@ -663,8 +666,6 @@ class Aurora_trainer:
 
                     lat_plot = lat.numpy()
                     lon_plot = lon.numpy()
-                    # Match the variable naming / title style used in
-                    # Taiwan-Aurora-Foundation-Model/plot/plot_hrrr_zero_shot.py
                     draw_vars_setting = {
                         "2t": ("surf_vars", kelvin_to_celsius, None, "Temperature at 2m (°C)"),
                         "10u": ("surf_vars", None, None, "U-wind at 10m (m/s)"),
@@ -692,7 +693,7 @@ class Aurora_trainer:
                             pred_v = convert_method(pred_v)
                             gt_v = convert_method(gt_v)
 
-                        this_date = predict_times[step] + timedelta(hours=self.tranditional_model_leadtime)
+                        this_date = predict_times[step] + timedelta(hours=self.leadtime)
                         this_date = this_date.strftime("%Y-%m-%d_%H")
 
                         fname = f"{self.test_on_map_dir}/{this_date}/{vname}.png"
@@ -729,21 +730,296 @@ class Aurora_trainer:
         source_name="NuWa",
     ):
 
+        def _parse_forecast_time(s):
+            if s is None:
+                return None
+            if isinstance(s, datetime):
+                return s
+            s = str(s).strip()
+            for fmt in ("%Y-%m-%d_%H", "%Y-%m-%d %H:%M", "%Y-%m-%d %H"):
+                try:
+                    return datetime.strptime(s, fmt)
+                except Exception:
+                    pass
+            return None
+
+        def _ensure_era5_baseline_ready():
+            if self._era5_baseline_ready:
+                return
+
+            era5_root = "/scratch5/users/nccu/era5_data/13level_global"
+            official_plot_root = os.path.abspath(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "..",
+                    "Taiwan-Aurora-Foundation-Model",
+                    "plot",
+                )
+            )
+
+            saved_sys_modules = {k: v for k, v in sys.modules.items() if k == "aurora" or k.startswith("aurora.")}
+            saved_sys_path = list(sys.path)
+            for k in list(saved_sys_modules.keys()):
+                del sys.modules[k]
+            sys.path.insert(0, official_plot_root)
+            try:
+                from aurora.model.aurora import AuroraSmall as OfficialAuroraSmall
+                from aurora import rollout as official_rollout
+                from aurora.batch import Batch as OfficialBatch, Metadata as OfficialMetadata
+                from aurora.utils.metrics import resize_tensor as official_resize_tensor
+            finally:
+                # Restore module resolution back to NuWa environment.
+                sys.path = saved_sys_path
+                # Intentionally keep the official `aurora` modules loaded in sys.modules.
+                # Baseline rollout/upsampling depends on them at runtime.
+
+            # Build official pretrained baseline model once.
+            model = OfficialAuroraSmall(use_lora=False, autocast=True)
+            model.load_checkpoint("microsoft/aurora", "aurora-0.25-small-pretrained.ckpt", strict=False)
+            model.eval()
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model = model.to(device)
+
+            dataset = Global_ERA5(
+                split="test",
+                root=era5_root,
+                leadtime=self.leadtime,
+                step=self.rollout_step,
+            )
+
+            self._era5_baseline_dataset = dataset
+            self._era5_baseline_model = model
+            self._era5_baseline_device = device
+            self._era5_baseline_official_rollout = official_rollout
+            self._era5_baseline_official_Batch = OfficialBatch
+            self._era5_baseline_official_Metadata = OfficialMetadata
+            self._era5_baseline_official_resize_tensor = official_resize_tensor
+            self._era5_baseline_pred_cache = {}
+            self._era5_baseline_ready = True
+
+        def _era5_get_batch(dataset, date_yyyymmddhh: str):
+            input_time = datetime.strptime(date_yyyymmddhh, "%Y%m%d%H")
+            hours_diff = int((input_time - dataset.start_time).total_seconds() / 3600)
+            if hours_diff < 0 or hours_diff >= len(dataset):
+                raise IndexError(
+                    f"date={date_yyyymmddhh} out of dataset range. start={dataset.start_time} len={len(dataset)}"
+                )
+            return dataset[hours_diff]
+
+        def _to_1d_lat_lon(lat_in, lon_in):
+            lat_t = torch.from_numpy(lat_in) if isinstance(lat_in, np.ndarray) else lat_in
+            lon_t = torch.from_numpy(lon_in) if isinstance(lon_in, np.ndarray) else lon_in
+            if not isinstance(lat_t, torch.Tensor):
+                lat_t = torch.tensor(lat_t)
+            if not isinstance(lon_t, torch.Tensor):
+                lon_t = torch.tensor(lon_t)
+            if lat_t.ndim == 2:
+                lat_t = lat_t[:, 0]
+            elif lat_t.ndim != 1:
+                lat_t = lat_t.flatten()
+            if lon_t.ndim == 2:
+                lon_t = lon_t[0, :]
+            elif lon_t.ndim != 1:
+                lon_t = lon_t.flatten()
+            return lat_t.float(), lon_t.float()
+
+        def _ensure_surf_4d(t):
+            if not isinstance(t, torch.Tensor):
+                t = torch.tensor(t, dtype=torch.float32)
+            if t.ndim == 2:
+                t = t.unsqueeze(0).unsqueeze(0)
+            elif t.ndim == 3:
+                t = t.unsqueeze(0)
+            elif t.ndim != 4:
+                raise ValueError(f"Unexpected surf tensor ndim={t.ndim} shape={tuple(t.shape)}")
+            return t.float()
+
+        def _ensure_atmos_5d(t):
+            if not isinstance(t, torch.Tensor):
+                t = torch.tensor(t, dtype=torch.float32)
+            if t.ndim == 3:
+                t = t.unsqueeze(0).unsqueeze(0)
+            elif t.ndim == 4:
+                t = t.unsqueeze(0)
+            elif t.ndim != 5:
+                raise ValueError(f"Unexpected atmos tensor ndim={t.ndim} shape={tuple(t.shape)}")
+            return t.float()
+
+        def _baseline_aurora_era5_field(var_key: str, forecast_dt: datetime, target_shape):
+            _ensure_era5_baseline_ready()
+
+            input_dt = forecast_dt - timedelta(hours=self.leadtime)
+            date_str = input_dt.strftime("%Y%m%d%H")
+
+            input_data, _labels = _era5_get_batch(self._era5_baseline_dataset, date_str)
+            lat1d, lon1d = _to_1d_lat_lon(input_data["lat"], input_data["lon"])
+
+            atmos_levels = input_data.get("atmos_levels", ())
+            if isinstance(atmos_levels, torch.Tensor):
+                if atmos_levels.ndim == 0:
+                    atmos_levels = (int(atmos_levels.item()),)
+                else:
+                    atmos_levels = tuple(int(x) for x in atmos_levels.detach().cpu().numpy().flatten().tolist())
+            elif isinstance(atmos_levels, (list, tuple, np.ndarray)):
+                atmos_levels = tuple(int(x) for x in np.array(atmos_levels).flatten().tolist())
+            else:
+                atmos_levels = ()
+
+            def _crop_by_lat_lon(lat_t, lon_t, data2d, lat_min=None, lat_max=None, lon_min=None, lon_max=None):
+                if lat_min is None and lat_max is None and lon_min is None and lon_max is None:
+                    return lat_t, lon_t, data2d
+
+                lat_np = lat_t.detach().cpu().numpy()
+                lon_np = lon_t.detach().cpu().numpy()
+
+                if lat_min is None:
+                    lat_min_ = float(lat_np.min())
+                else:
+                    lat_min_ = float(lat_min)
+                if lat_max is None:
+                    lat_max_ = float(lat_np.max())
+                else:
+                    lat_max_ = float(lat_max)
+                if lat_min_ > lat_max_:
+                    lat_min_, lat_max_ = lat_max_, lat_min_
+
+                if lon_min is None:
+                    lon_min_ = float(lon_np.min())
+                else:
+                    lon_min_ = float(lon_min)
+                if lon_max is None:
+                    lon_max_ = float(lon_np.max())
+                else:
+                    lon_max_ = float(lon_max)
+                if lon_min_ > lon_max_:
+                    lon_min_, lon_max_ = lon_max_, lon_min_
+
+                y_mask = (lat_np >= lat_min_) & (lat_np <= lat_max_)
+                x_mask = (lon_np >= lon_min_) & (lon_np <= lon_max_)
+
+                y_idx = np.where(y_mask)[0]
+                x_idx = np.where(x_mask)[0]
+                if y_idx.size == 0 or x_idx.size == 0:
+                    raise ValueError(
+                        "Crop bounds produced empty region. "
+                        f"lat[{lat_np.min():.3f},{lat_np.max():.3f}] lon[{lon_np.min():.3f},{lon_np.max():.3f}] "
+                        f"requested lat[{lat_min_},{lat_max_}] lon[{lon_min_},{lon_max_}]"
+                    )
+
+                y0, y1 = y_idx.min(), y_idx.max() + 1
+                x0, x1 = x_idx.min(), x_idx.max() + 1
+                return lat_t[y0:y1], lon_t[x0:x1], data2d[y0:y1, x0:x1]
+
+            def _resize_2d_field_with_metrics(arr2d):
+                if not isinstance(arr2d, np.ndarray):
+                    arr2d = np.asarray(arr2d)
+                t = torch.tensor(arr2d, dtype=torch.float32)
+                t4 = t.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+                t4_r = self._era5_baseline_official_resize_tensor(t4)
+                return t4_r[0, 0].detach().cpu().numpy()
+
+            if date_str in self._era5_baseline_pred_cache:
+                pred_batch = self._era5_baseline_pred_cache[date_str]
+            else:
+                #   surf_vars: (B,T,H,W)
+                #   atmos_vars: (B,T,C,H,W)
+                surf_vars = {k: _ensure_surf_4d(v) for k, v in input_data["surf_vars"].items()}
+                atmos_vars = {k: _ensure_atmos_5d(v) for k, v in input_data["atmos_vars"].items()}
+
+                batch_input = self._era5_baseline_official_Batch(
+                    surf_vars=surf_vars,
+                    static_vars=input_data.get("static_vars", {}),
+                    atmos_vars=atmos_vars,
+                    metadata=self._era5_baseline_official_Metadata(
+                        lat=lat1d,
+                        lon=lon1d,
+                        time=[input_dt],
+                        atmos_levels=atmos_levels,
+                    ),
+                ).to(self._era5_baseline_device)
+
+                with torch.no_grad():
+                    pred_batch = list(
+                        self._era5_baseline_official_rollout(
+                            self._era5_baseline_model,
+                            batch_input,
+                            steps=self.rollout_step,
+                            leadtime=self.leadtime,
+                        )
+                    )[0]
+
+                self._era5_baseline_pred_cache[date_str] = pred_batch
+
+            # Extract one variable (cropped + upsampled) like plot_results does.
+            lat_min = float(lat.min())
+            lat_max = float(lat.max())
+            lon_min = float(lon.min())
+            lon_max = float(lon.max())
+
+            if var_key in ("2t", "10u", "10v", "msl"):
+                pred2d = pred_batch.surf_vars[var_key][0, 0].detach().cpu().numpy()
+                if var_key == "2t":
+                    pred2d = kelvin_to_celsius(pred2d)
+                elif var_key == "msl":
+                    pred2d = pred2d / 100.0
+
+            elif var_key in ("t_850", "t850"):
+                actual_key = "t"
+                target_pressure = 850
+                convert_func = kelvin_to_celsius
+
+                levels_np = np.array(atmos_levels, dtype=np.int32).flatten()
+                level_idx = int(np.argmin(np.abs(levels_np - target_pressure)))
+
+                pred_a = _ensure_atmos_5d(pred_batch.atmos_vars[actual_key])
+                level_idx = max(0, min(level_idx, pred_a.shape[2] - 1))
+                pred2d = pred_a[0, 0, level_idx].detach().cpu().numpy()
+                pred2d = convert_func(pred2d)
+
+            elif var_key in ("z_500", "z500"):
+                actual_key = "z"
+                target_pressure = 500
+                convert_func = geopotential_to_height
+
+                levels_np = np.array(atmos_levels, dtype=np.int32).flatten()
+                level_idx = int(np.argmin(np.abs(levels_np - target_pressure)))
+
+                pred_a = _ensure_atmos_5d(pred_batch.atmos_vars[actual_key])
+                level_idx = max(0, min(level_idx, pred_a.shape[2] - 1))
+                pred2d = pred_a[0, 0, level_idx].detach().cpu().numpy()
+                pred2d = convert_func(pred2d)
+
+            else:
+                raise KeyError(f"Unknown variable for baseline: var_key={var_key}")
+
+            _, _, pred_c = _crop_by_lat_lon(lat1d, lon1d, pred2d, lat_min=lat_min, lat_max=lat_max, lon_min=lon_min, lon_max=lon_max)
+            pred_up = _resize_2d_field_with_metrics(pred_c)
+
+            th, tw = int(target_shape[0]), int(target_shape[1])
+            if pred_up.shape != (th, tw):
+                pred_up = resize(pred_up, (th, tw), anti_aliasing=True, preserve_range=True).astype(np.float32)
+            return pred_up
+
         lat = np.array(lat)
         lon = np.array(lon)
 
         fig, axes = plt.subplots(1, 3, figsize=(20, 6), subplot_kw={"projection": ccrs.PlateCarree()})
 
-        # Mirror the subplot title style used in plot_hrrr_zero_shot.py
+        # 3 panels: NuWa inference, Aurora zero-shot (upsampled), and their difference
         if level_idx is None:
-            labels = [f"Prediction ({source_name})", f"Ground Truth ({source_name})", "Difference |Pred - GT|"]
+            labels = [
+                f"Prediction ({source_name})",
+                "Baseline (ERA5 → Aurora pretrained)",
+                "Difference |Pred - Baseline|",
+            ]
         else:
             labels = [
-                f"Prediction ({source_name}, level_idx={level_idx})",
-                f"Ground Truth ({source_name}, level_idx={level_idx})",
-                "Difference |Pred - GT|",
+                f"Prediction ({source_name}",
+                f"Baseline (ERA5 → Aurora pretrained",
+                "Difference |Pred - Baseline|",
             ]
-        extent = [lon.min(), lon.max(), lat.min(), lat.max()] # refine the map to certain region like TW, USA
+        extent = [lon.min(), lon.max(), lat.min(), lat.max()]
 
         for ax in axes:
             ax.set_extent(extent, crs=ccrs.PlateCarree())
@@ -756,14 +1032,49 @@ class Aurora_trainer:
             gl.bottom_labels = False
             gl.left_labels = True
 
-        diff = np.abs(pred - gt)
+        forecast_dt = _parse_forecast_time(forecast_time)
+        var_key = str(title).strip().lower()
+        baseline = _baseline_aurora_era5_field(var_key, forecast_dt, pred.shape)
+        diff = np.abs(pred - baseline)
 
-        vmin = min(pred.min(), gt.min()) if vmin is None else vmin
-        vmax = max(pred.max(), gt.max()) if vmax is None else vmax
+        plot_cfg = {
+            # surface vars
+            "2t": {"cmap": "RdBu_r", "vmin": -5, "vmax": 25},
+            "10u": {"cmap": "RdBu_r", "vmin": -15, "vmax": 2.5},
+            "10v": {"cmap": "RdBu_r", "vmin": -15, "vmax": 2.5},
+            "msl": {"cmap": "viridis", "vmin": 950, "vmax": 1050},
+            # atmos vars
+            "t": {"cmap": "RdBu_r", "vmin": -80, "vmax": 50},
+            "u": {"cmap": "RdBu_r", "vmin": -80, "vmax": 80},
+            "v": {"cmap": "RdBu_r", "vmin": -80, "vmax": 80},
+            "q": {"cmap": "viridis", "vmin": 0, "vmax": 0.02},
+            "z": {"cmap": "viridis", "vmin": 0, "vmax": 20000},
+            "z500": {"cmap": "viridis", "vmin": 5700, "vmax": 5900},
+            "t850": {"cmap": "RdYlBu_r", "vmin": 1, "vmax": 15},
+        }
 
-        im_pred = axes[0].pcolormesh(lon, lat, pred, cmap="RdBu_r", vmin=vmin, vmax=vmax)
-        im_gt   = axes[1].pcolormesh(lon, lat, gt,  cmap="RdBu_r", vmin=vmin, vmax=vmax)
-        im_diff = axes[2].pcolormesh(lon, lat, diff, cmap="Greys")
+        cfg = plot_cfg.get(var_key)
+        cmap = cfg["cmap"] if cfg is not None else "RdBu_r"
+        if cfg is not None:
+            vmin = cfg["vmin"] if vmin is None else vmin
+            vmax = cfg["vmax"] if vmax is None else vmax
+        else:
+            vmin = min(pred.min(), gt.min()) if vmin is None else vmin
+            vmax = max(pred.max(), gt.max()) if vmax is None else vmax
+
+        diff_vmax = 200 if var_key in ("z500", "z_500") else 30
+
+        # Smooth only the prediction panel for a more continuous look.
+        pred_plot = pred
+        try:
+            if isinstance(pred_plot, np.ndarray) and np.isfinite(pred_plot).all():
+                pred_plot = gaussian_filter(pred_plot, sigma=2.0, preserve_range=True)
+        except Exception:
+            pred_plot = pred
+
+        im_pred = axes[0].pcolormesh(lon, lat, pred_plot, cmap=cmap, vmin=vmin, vmax=vmax)
+        im_gt = axes[1].pcolormesh(lon, lat, baseline, cmap=cmap, vmin=vmin, vmax=vmax)
+        im_diff = axes[2].pcolormesh(lon, lat, diff, cmap="binary", vmin=0, vmax=diff_vmax)
 
         axes[0].set_title(labels[0])
         axes[1].set_title(labels[1])

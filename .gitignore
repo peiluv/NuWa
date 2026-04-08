@@ -1,0 +1,11 @@
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.onnx
+checkpoints/
+outputs/
+metrics
+runs/
+logs/
+plot/
